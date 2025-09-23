@@ -9,7 +9,7 @@ This guide walks you through installing the HASSL compiler, writing your first `
 HASSL will ship as a Python package. For now, clone the repo and install it locally:
 
 ```bash
-git clone https://github.com/yourname/hassl.git
+git clone https://github.com/adanowitz/hassl.git
 cd hassl
 pip install -e .
 ```
@@ -68,7 +68,7 @@ This generates a package directory with:
 ## 4. Load into Home Assistant
 
 1. Copy the `packages/hassl_living/` folder into your Home Assistant `config/packages/` directory.  
-   If you donât have `packages` enabled, add this to your `configuration.yaml`:
+   If you don't have `packages` enabled, add this to your `configuration.yaml`:
 
    ```yaml
    homeassistant:
@@ -89,7 +89,7 @@ Check the **Logbook** or **Developer Tools â States** to see HASSL helpers 
 
 ---
 
-## ð Next steps
+## 6. Next steps
 
 - Try `sync all [light.desk, light.strip, light.lamp] as work_sync { invert: light.lamp }`
 - Explore `not_by rule("name")` to separate causes between rules.
