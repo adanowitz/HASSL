@@ -1,6 +1,17 @@
-# HASSL Language Specification
+# HASSL — Home Assistant Simple Scripting Language
 
-This document describes the grammar, semantics, and usage examples of **HASSL** (Home Assistant Simple Scripting Language).
+HASSL is a tiny domain-specific language for writing **simple, declarative automations** for [Home Assistant](https://www.home-assistant.io/).  
+It lets you describe synchronization groups and rules in **one line or two** instead of dozens of lines of YAML or Node-RED JSON.
+
+---
+
+## ✨ Features
+
+- **Aliases** for entities  
+- **Sync groups** (`onoff`, `dimmer`, `shared`, `all`) with *implied loop-safety*  
+- **Rules** with boolean conditions, waits, and auto-reverts  
+- **Race-proof** semantics via Home Assistant context IDs (`not_by this|rule|any_hassl`)  
+- **Rule control** (`disable` / `enable`) and **tags** for metadata  
 
 ---
 
@@ -55,137 +66,82 @@ duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
 ## 🔧 Semantics
 
 ### Aliases
-
 ```hassl
 alias light = light.living
 alias motion = binary_sensor.hall_motion
 alias lux    = sensor.living_luminance
 ```
 
-- Aliases are compile-time shorthands for entity IDs.
-- After alias expansion, all rules and syncs work on full entity IDs.
-
----
-
-### Sync
-
+### Sync groups
 ```hassl
 sync onoff [light.kitchen, switch.floor] as circuit
 sync shared [light.kitchen, switch.floor] as shared_sync
 sync all [light.desk, light.strip, switch.floor] as mixed_sync { invert: switch.floor }
 ```
 
-#### Properties synchronized
-- **onoff** → binary state only  
-- **dimmer** → on/off + brightness (and color temp if supported by both)  
-- **shared** → properties supported by *all* entities in the group  
-- **all** → properties supported by *at least two* entities in the group  
-- **invert** (optional) → reverses `on ↔ off` for listed entities (onoff only)
+- **onoff**: sync only on/off state  
+- **dimmer**: sync on/off + brightness (and color temp if supported)  
+- **shared**: sync properties supported by *all* members  
+- **all**: sync any property supported by *≥ 2* members  
+- **invert**: optional, only for on/off
 
-#### Execution model
-For each synchronized property:
-1. **Devices → Proxy**
-   - Trigger when a device’s property changes.
-   - Guarded with **implied `not_by this`**: ignores changes caused by the sync itself.
-   - Updates the proxy helper (`input_boolean` or `input_number`).
-
-2. **Proxy → Devices**
-   - Trigger when the proxy changes.
-   - For each member whose value differs, call a **writer script** to set the new value.
-   - Writer scripts stamp context IDs so the upstream guard can recognize their origin.
-
-#### Guarantees
-- **Loop-safe:** No feedback or infinite toggles (`not_by this` is implied).
-- **Idempotent:** Devices are only written if their state differs from proxy.
-- **Last-write-wins:** Upstream automations use `mode: restart` so the newest event dominates.
-
----
+> 🔒 All syncs have **implied `not_by this` guards** → no race loops, no debounce required.
 
 ### Rules
-
 ```hassl
 rule motion_on_light:
   if (light == off && motion && lux < 50)
   then light = on for 10m
 ```
 
-#### Conditions
-- Evaluated when any referenced entity changes.
-- Boolean operators: `&&`, `||`, `!`
-- Comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`
-
-#### Qualifiers
-- `not_by this` → event not caused by this rule’s last write  
-- `not_by rule("name")` → event not caused by the named rule  
-- `not_by any_hassl` → event not caused by any HASSL-generated write  
-
-#### Actions
-- **Assignment**:  
-  `light = on for 10m`  
-  Turns entity on; auto-reverts after 10 minutes (cancelled if rule restarts).
-- **Wait**:  
-  `wait (!motion for 1h) light = off`  
-  Suspends until condition holds continuously for the duration, then executes.
-- **Rule control**:  
-  `disable rule motion_on_light for 3m`  
-  Toggles rule enable flags via helpers.
-- **Tags**:  
-  `tag override = "manual"`  
-  Stores metadata in a helper.
-
----
+- **Assignments** can have a `for` duration → auto-revert  
+- **Conditions** can use `&&`, `||`, `!`, comparisons
 
 ### Waits
-
 ```hassl
 rule switch_keep_on:
   if (light == on not_by any_hassl)
   then wait (!motion for 1h) light = off
 ```
 
-- Compiled to HA `wait_for_trigger` blocks.
-- Enforces a continuous period of the condition holding true.
+- `wait (COND for DUR) A` suspends until condition holds continuously, then performs action.
 
----
-
-### Rule Control
-
+### Rule control
 ```hassl
 rule switch_off_disable_motion:
   if (light transitions off not_by this)
   then disable rule motion_on_light for 3m
 ```
 
-- Each rule has an enable flag (`input_boolean.hassl_rule__<name>__enabled`).
-- Conditions include a check for the flag.
-- `disable`/`enable` rules toggle these flags for the given duration.
-
----
-
 ### Tags
-
 ```hassl
 if (light == on not_by any_hassl) then tag override = "manual"
 ```
 
-- Tags are stored in helpers (`input_text.hassl_tag__<name>`).
-- Can be read by other automations or used for debugging.
+Tags are stored in helpers; can be used for debugging or extra logic.
 
 ---
 
-## ⚙️ Execution Guarantees
+## 🛠 Compiler Mapping
 
-- **Loop-safety:** All sync flows ignore their own writes (via context IDs).  
-- **Race resistance:** Last external change wins; fan-out is idempotent.  
-- **Determinism:** Conditions and waits are re-evaluated only when relevant entities change.  
-- **Isolation:** Rules can be temporarily disabled/enabled, without affecting others.
+HASSL compiles to a **Home Assistant package** containing:
+
+- **Helpers**
+  - `input_text.hassl_ctx__<entity>[__<prop>]` for context tracking  
+  - `input_boolean.hassl_rule__<rule>__enabled` for rule gating  
+  - `input_boolean` / `input_number` proxies for sync groups  
+- **Writer scripts**  
+  - Scripts that stamp `this.context.id` → helper, then call the real HA service  
+- **Automations**  
+  - Device→Proxy (with `not_by this` guards)  
+  - Proxy→Devices (idempotent fan-out)  
+  - Rules with waits, disables, and tags
 
 ---
 
-## ✅ Worked Examples
+## ✅ Examples
 
 ### Motion + Lux + Override
-
 ```hassl
 alias light  = light.living
 alias motion = binary_sensor.hall_motion
@@ -204,16 +160,19 @@ rule switch_off_disable_motion:
   then disable rule motion_on_light for 3m
 ```
 
-### Sync a light with its switch (same circuit)
-
+### Sync group
 ```hassl
 sync shared [light.living, switch.living_circuit] as living_sync
 ```
 
-### Mixed devices with inversion
+---
 
-```hassl
-sync all [light.desk, light.strip, light.lamp] as work_sync { invert: light.lamp }
-```
+## 🚀 Roadmap
 
-This keeps brightness and color in sync across the lights, while `light.lamp` has inverted on/off behavior.
+- [ ] MVP compiler to Home Assistant YAML packages  
+- [ ] Extended property coverage (media players, covers, fans)  
+- [ ] Optional backends: pyscript, AppDaemon, Node-RED  
+- [ ] CLI tool `hasslc file.hassl -o packages/`
+
+---
+
