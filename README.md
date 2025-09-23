@@ -14,7 +14,7 @@ statement      = alias_stmt | sync_stmt | rule_stmt ;
 alias_stmt     = "alias" ident "=" entity ;
 
 sync_stmt      = "sync" sync_type "[" entity_list "]" "as" ident [ sync_opts ] ;
-sync_type      = "onoff" | "dimmer" | "attribute" | "all_shared" | "all" ;
+sync_type      = "onoff" | "dimmer" | "attribute" | "shared" | "all" ;
 sync_opts      = "{" [ sync_opt { ";" sync_opt } ] "}" ;
 sync_opt       = "invert" ":" entity_list ;
 
@@ -71,14 +71,14 @@ alias lux    = sensor.living_luminance
 
 ```hassl
 sync onoff [light.kitchen, switch.floor] as circuit
-sync all_shared [light.kitchen, switch.floor] as shared_sync
+sync shared [light.kitchen, switch.floor] as shared_sync
 sync all [light.desk, light.strip, switch.floor] as mixed_sync { invert: switch.floor }
 ```
 
 #### Properties synchronized
 - **onoff** → binary state only  
 - **dimmer** → on/off + brightness (and color temp if supported by both)  
-- **all_shared** → properties supported by *all* entities in the group  
+- **shared** → properties supported by *all* entities in the group  
 - **all** → properties supported by *at least two* entities in the group  
 - **invert** (optional) → reverses `on ↔ off` for listed entities (onoff only)
 
@@ -207,7 +207,7 @@ rule switch_off_disable_motion:
 ### Sync a light with its switch (same circuit)
 
 ```hassl
-sync all_shared [light.living, switch.living_circuit] as living_sync
+sync shared [light.living, switch.living_circuit] as living_sync
 ```
 
 ### Mixed devices with inversion
