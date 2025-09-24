@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: hassl
+Version: 0.1.0
+Summary: HASSL: Home Assistant Simple Scripting Language
+Author: adanowitz
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: lark-parser
+Requires-Dist: jinja2
+Requires-Dist: pyyaml

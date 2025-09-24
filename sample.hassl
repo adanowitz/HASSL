@@ -1,0 +1,8 @@
+alias light  = light.living
+alias motion = binary_sensor.hall_motion
+alias lux    = sensor.living_luminance
+sync shared [light.living, switch.living_circuit] as living_sync
+rule motion_on_light:
+  if (light == off && motion && lux < 50) then light = on for 10m
+rule set_brightness:
+  if (light == on) then light.living.brightness = 180

@@ -1,0 +1,21 @@
+{
+  "aliases": {
+    "a": "light.kitchen",
+    "b": "switch.kitchen_circuit"
+  },
+  "syncs": [
+    {
+      "name": "ksync",
+      "kind": "shared",
+      "members": [
+        "light.kitchen",
+        "switch.kitchen_circuit"
+      ],
+      "invert": [],
+      "properties": [
+        "onoff"
+      ]
+    }
+  ],
+  "rules": []
+}

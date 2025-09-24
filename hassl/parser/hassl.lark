@@ -1,0 +1,55 @@
+
+// HASSL grammar subset: aliases, sync, and rules (conditions/actions).
+start: stmt*
+stmt: alias | sync | rule
+
+alias: "alias" CNAME "=" entity
+sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
+synctype: "onoff" | "dimmer" | "attribute" | "shared" | "all"
+syncopts: "{" ("invert" ":" entity_list) "}"
+
+rule: "rule" CNAME ":" if_clause+
+if_clause: "if" "(" condition ")" "then" actions
+
+?condition: expr qualifier?
+qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
+
+?expr: expr "||" andexpr   -> or
+     | andexpr
+?andexpr: andexpr "&&" term -> and
+        | term
+?term: "!" term             -> not
+    | "(" expr ")"
+    | comparison
+
+comparison: operand OP operand
+          | operand                -> bare_operand
+OP: "==" | "!=" | "<" | ">" | "<=" | ">="
+
+operand: entity | CNAME | STATE | NUMBER | STRING
+
+STATE: "on" | "off"
+NUMBER: INT | SIGNED_NUMBER
+
+actions: action (";" action)*
+action: assign | attr_assign | waitact | rulectrl | tagact
+
+assign: CNAME "=" STATE ("for" dur)?
+attr_assign: entity "." CNAME "=" NUMBER
+
+waitact: "wait" "(" condition "for" dur ")" action
+rulectrl: ("disable" | "enable") "rule" CNAME "for" dur
+tagact: "tag" CNAME "=" (STRING | CNAME | NUMBER)
+
+dur: INT ("ms"|"s"|"m"|"h"|"d")
+
+entity: CNAME ("." CNAME)+
+
+COMMENT: /#[^\n]*/
+%ignore COMMENT
+%import common.CNAME
+%import common.WS
+%import common.ESCAPED_STRING -> STRING
+%import common.INT
+%import common.SIGNED_NUMBER
+%ignore WS

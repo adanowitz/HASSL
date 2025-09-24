@@ -1,0 +1,2 @@
+## Contributing
+Run pytest.
