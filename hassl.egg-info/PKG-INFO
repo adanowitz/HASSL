@@ -5,6 +5,11 @@ Summary: HASSL: Home Assistant Simple Scripting Language
 Author: adanowitz
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: lark-parser
 Requires-Dist: jinja2
 Requires-Dist: pyyaml
+Dynamic: license-file
+
+# HASSL
+See quickstart in docs.

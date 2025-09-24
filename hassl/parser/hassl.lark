@@ -1,29 +1,43 @@
 
-// HASSL grammar subset: aliases, sync, and rules (conditions/actions).
+// HASSL grammar: aliases, sync, and rules (conditions/actions).
+// Uses keyword-safe transformer rule names: or_, and_, not_
+
 start: stmt*
-stmt: alias | sync | rule
+
+stmt: alias
+    | sync
+    | rule
 
 alias: "alias" CNAME "=" entity
+
+// sync synctype [entity_list] as name { invert: entity_list }?
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
+
 synctype: "onoff" | "dimmer" | "attribute" | "shared" | "all"
+
 syncopts: "{" ("invert" ":" entity_list) "}"
 
+// ---- Rules ----
 rule: "rule" CNAME ":" if_clause+
+
 if_clause: "if" "(" condition ")" "then" actions
 
+// ---- Conditions ----
 ?condition: expr qualifier?
+
 qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
 
-?expr: expr "||" andexpr   -> or
+?expr: expr "||" andexpr   -> or_
      | andexpr
-?andexpr: andexpr "&&" term -> and
+?andexpr: andexpr "&&" term -> and_
         | term
-?term: "!" term             -> not
+?term: "!" term             -> not_
     | "(" expr ")"
     | comparison
 
 comparison: operand OP operand
           | operand                -> bare_operand
+
 OP: "==" | "!=" | "<" | ">" | "<=" | ">="
 
 operand: entity | CNAME | STATE | NUMBER | STRING
@@ -31,20 +45,35 @@ operand: entity | CNAME | STATE | NUMBER | STRING
 STATE: "on" | "off"
 NUMBER: INT | SIGNED_NUMBER
 
+// ---- Actions ----
 actions: action (";" action)*
-action: assign | attr_assign | waitact | rulectrl | tagact
+
+action: assign
+      | attr_assign
+      | waitact
+      | rulectrl
+      | tagact
 
 assign: CNAME "=" STATE ("for" dur)?
-attr_assign: entity "." CNAME "=" NUMBER
+
+entity_path: CNAME ("." CNAME)+
+
+attr_assign: entity_path "." CNAME "=" NUMBER
 
 waitact: "wait" "(" condition "for" dur ")" action
+
 rulectrl: ("disable" | "enable") "rule" CNAME "for" dur
+
 tagact: "tag" CNAME "=" (STRING | CNAME | NUMBER)
 
 dur: INT ("ms"|"s"|"m"|"h"|"d")
 
+// ---- Atoms ----
+entity_list: entity ("," entity)*
+
 entity: CNAME ("." CNAME)+
 
+// ---- Lexer ----
 COMMENT: /#[^\n]*/
 %ignore COMMENT
 %import common.CNAME

@@ -1,5 +1,5 @@
 from lark import Transformer, v_args, Token
-from . import nodes
+from ..ast import nodes
 
 def _atom(val):
     if isinstance(val, Token):
@@ -60,9 +60,9 @@ class HasslTransformer(Transformer):
         if qual is not None: cond.update(qual)
         return cond
 
-    def or(self, left, right):  return {"op": "or", "left": left, "right": right}
-    def and(self, left, right): return {"op": "and", "left": left, "right": right}
-    def not(self, term):        return {"op": "not", "value": term}
+    def or_(self, left, right):  return {"op": "or", "left": left, "right": right}
+    def and_(self, left, right): return {"op": "and", "left": left, "right": right}
+    def not_(self, term):        return {"op": "not", "value": term}
     def comparison(self, left, op=None, right=None):
         if op is None: return left
         return {"op": str(op), "left": left, "right": right}
@@ -75,6 +75,8 @@ class HasslTransformer(Transformer):
         act = {"type": "assign", "target": str(name), "state": str(state)}
         if for_parts: act["for"] = for_parts[0]
         return act
+    def entity_path(self, *parts):
+        return ".".join(str(p) for p in parts)
     def attr_assign(self, entity, attr, value):
         return {"type":"attr_assign","entity": entity, "attr": str(attr), "value": value}
     def waitact(self, cond, dur, action):
