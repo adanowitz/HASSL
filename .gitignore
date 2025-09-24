@@ -1,0 +1,72 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.venv*/
+*.env
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+coverage.xml
+
+# Pytest caches
+.cache/
+*.pytest_cache/
+
+# Jupyter / IPython
+.ipynb_checkpoints
+*.ipynb
+
+# MyPy / type checker
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*~
+
+# Home Assistant generated / compiled files
+home-assistant.log
+home-assistant_v2.db
+*.db-shm
+*.db-wal
+.storage/
+deps/
+
+# Generated YAML packages from HASSL codegen
+packages/out/
+packages/hassl_*/
+
+# Local test outputs
+tmp/
+out/
+*.yaml~
+*.bak
+
+# System files
+.DS_Store
+Thumbs.db
+

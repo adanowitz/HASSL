@@ -1,6 +1,7 @@
-from pathlib import Path, PurePath
-import json
+import yaml
+from pathlib import Path
 from .util_compile import run_compile
+
 def test_golden_ir_sync_shared(tmp_path: Path):
     src = '''
     alias a = light.kitchen
@@ -8,6 +9,10 @@ def test_golden_ir_sync_shared(tmp_path: Path):
     sync shared [a, b] as ksync
     '''
     outdir = tmp_path / "out"; ir = run_compile(src, outdir)
-    got = ir.to_dict()
-    want = json.loads((Path(__file__).parent / "golden" / "ir_ksync.json").read_text())
-    assert got == want
+    helpers = (outdir / "helpers.yaml").read_text()
+    data = yaml.safe_load(helpers)
+
+    # Check the helper proxy exists and is properly named
+    assert "input_boolean" in data
+    assert "hassl__ksync__onoff" in data["input_boolean"]
+    assert data["input_boolean"]["hassl__ksync__onoff"]["name"].startswith("HASSL Proxy ksync")

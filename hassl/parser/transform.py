@@ -1,4 +1,3 @@
-# Transformer patch: robust dur() and stable synctype via explicit terminals
 from lark import Transformer, v_args, Token
 from ..ast import nodes
 
@@ -28,36 +27,28 @@ class HasslTransformer(Transformer):
     def start(self, *stmts):
         return nodes.Program(statements=self.stmts)
 
-    # alias
     def alias(self, name, entity):
         a = nodes.Alias(name=str(name), entity=str(entity))
-        self.stmts.append(a)
-        return a
+        self.stmts.append(a); return a
 
-    # sync
     def sync(self, synctype, members, name, syncopts=None):
         invert = []
-        if isinstance(syncopts, list):
-            invert = syncopts
+        if isinstance(syncopts, list): invert = syncopts
         s = nodes.Sync(kind=str(synctype), members=members, name=str(name), invert=invert)
         self.stmts.append(s); return s
 
-    # synctype now always receives one explicit terminal (ONOFF/DIMMER/ATTRIBUTE/SHARED/ALL)
-    def synctype(self, tok):
-        return str(tok)
-
+    def synctype(self, tok): return str(tok)
     def syncopts(self, *args): return list(args)[-1] if args else []
     def entity_list(self, *entities): return [str(e) for e in entities]
+    def member(self, val): return val
     def entity(self, *parts): return ".".join(str(p) for p in parts)
 
-    # rules
     def rule(self, name, *if_clauses):
         r = nodes.Rule(name=str(name), clauses=list(if_clauses))
         self.stmts.append(r); return r
 
     def if_clause(self, condition, actions): return nodes.IfClause(condition=condition, actions=actions)
 
-    # ---- condition + expr ----
     def qualifier(self, *args):
         if len(args) == 1 and isinstance(args[0], str):
             return {"not_by": args[0]}
@@ -82,17 +73,15 @@ class HasslTransformer(Transformer):
     def operand(self, val): return _atom(val)
     def OP(self, tok): return str(tok)
 
-    # ---- actions ----
     def actions(self, *acts): return list(acts)
-    def action(self, act): return act  # unwrap Tree('action', ...)
+    def action(self, act): return act
 
     def dur(self, n, unit):
         return f"{int(str(n))}{str(unit)}"
 
     def assign(self, name, state, *for_parts):
         act = {"type": "assign", "target": str(name), "state": str(state)}
-        if for_parts:
-            act["for"] = for_parts[0]  # already normalized by dur()
+        if for_parts: act["for"] = for_parts[0]
         return act
 
     def attr_assign(self, *parts):

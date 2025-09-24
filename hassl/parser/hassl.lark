@@ -1,5 +1,5 @@
-// HASSL grammar: aliases, sync, and rules (conditions/actions).
-// Keyword-safe transformer rule names: or_, and_, not_
+
+// HASSL grammar (sync members fix): entity_list accepts aliases (CNAME) or full entities
 
 start: stmt*
 
@@ -9,10 +9,8 @@ stmt: alias
 
 alias: "alias" CNAME "=" entity
 
-// sync synctype [entity_list] as name { invert: entity_list }?
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
 
-// Explicit terminals for synctype to ensure a stable token is produced
 ONOFF: "onoff"
 DIMMER: "dimmer"
 ATTRIBUTE: "attribute"
@@ -22,14 +20,10 @@ synctype: ONOFF | DIMMER | ATTRIBUTE | SHARED | ALL
 
 syncopts: "{" ("invert" ":" entity_list) "}"
 
-// ---- Rules ----
 rule: "rule" CNAME ":" if_clause+
-
 if_clause: "if" "(" condition ")" "then" actions
 
-// ---- Conditions ----
 ?condition: expr qualifier?
-
 qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
 
 ?expr: expr "||" andexpr   -> or_
@@ -50,9 +44,7 @@ operand: entity | CNAME | STATE | NUMBER | STRING
 STATE: "on" | "off"
 NUMBER: INT | SIGNED_NUMBER
 
-// ---- Actions ----
 actions: action (";" action)*
-
 action: assign
       | attr_assign
       | waitact
@@ -60,32 +52,27 @@ action: assign
       | tagact
 
 assign: CNAME "=" STATE ("for" dur)?
-
-// Unambiguous attribute assignment: N>=2 segments for entity, then an attribute name
 attr_assign: CNAME "." CNAME ("." CNAME)* "." CNAME "=" NUMBER
 
 waitact: "wait" "(" condition "for" dur ")" action
-
 rulectrl: ("disable" | "enable") "rule" CNAME "for" dur
-
 tagact: "tag" CNAME "=" (STRING | CNAME | NUMBER)
 
-// Duration: integer + unit
 dur: INT UNIT
 UNIT: "ms" | "s" | "m" | "h" | "d"
 
 // ---- Atoms ----
-entity_list: entity ("," entity)*
+entity_list: member ("," member)*
+member: entity | CNAME
 
 entity: CNAME ("." CNAME)+
 
 // ---- Lexer ----
-COMMENT: /#[^
-]*/
-%ignore COMMENT
 %import common.CNAME
 %import common.WS
 %import common.ESCAPED_STRING -> STRING
 %import common.INT
 %import common.SIGNED_NUMBER
+LINE_COMMENT: /\/\/[^\n]*/
+%ignore LINE_COMMENT
 %ignore WS
