@@ -1,6 +1,5 @@
-
 // HASSL grammar: aliases, sync, and rules (conditions/actions).
-// Uses keyword-safe transformer rule names: or_, and_, not_
+// Keyword-safe transformer rule names: or_, and_, not_
 
 start: stmt*
 
@@ -13,7 +12,13 @@ alias: "alias" CNAME "=" entity
 // sync synctype [entity_list] as name { invert: entity_list }?
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
 
-synctype: "onoff" | "dimmer" | "attribute" | "shared" | "all"
+// Explicit terminals for synctype to ensure a stable token is produced
+ONOFF: "onoff"
+DIMMER: "dimmer"
+ATTRIBUTE: "attribute"
+SHARED: "shared"
+ALL: "all"
+synctype: ONOFF | DIMMER | ATTRIBUTE | SHARED | ALL
 
 syncopts: "{" ("invert" ":" entity_list) "}"
 
@@ -56,9 +61,8 @@ action: assign
 
 assign: CNAME "=" STATE ("for" dur)?
 
-entity_path: CNAME ("." CNAME)+
-
-attr_assign: entity_path "." CNAME "=" NUMBER
+// Unambiguous attribute assignment: N>=2 segments for entity, then an attribute name
+attr_assign: CNAME "." CNAME ("." CNAME)* "." CNAME "=" NUMBER
 
 waitact: "wait" "(" condition "for" dur ")" action
 
@@ -66,7 +70,9 @@ rulectrl: ("disable" | "enable") "rule" CNAME "for" dur
 
 tagact: "tag" CNAME "=" (STRING | CNAME | NUMBER)
 
-dur: INT ("ms"|"s"|"m"|"h"|"d")
+// Duration: integer + unit
+dur: INT UNIT
+UNIT: "ms" | "s" | "m" | "h" | "d"
 
 // ---- Atoms ----
 entity_list: entity ("," entity)*
@@ -74,7 +80,8 @@ entity_list: entity ("," entity)*
 entity: CNAME ("." CNAME)+
 
 // ---- Lexer ----
-COMMENT: /#[^\n]*/
+COMMENT: /#[^
+]*/
 %ignore COMMENT
 %import common.CNAME
 %import common.WS
