@@ -5,6 +5,7 @@ from .ast.nodes import Program
 from lark import Lark
 from .semantics.analyzer import analyze
 from .codegen.package import emit_package
+from .codegen import generate as codegen_generate
 
 GRAMMAR_PATH = os.path.join(os.path.dirname(__file__), "parser", "hassl.lark")
 
@@ -29,6 +30,10 @@ def main():
     print("[hasslc] AST:", program.to_dict())
     ir = analyze(program)
     print("[hasslc] IR:", ir.to_dict())
+
+    ir_dict = ir.to_dict() if hasattr(ir, "to_dict") else ir
+    codegen_generate(ir_dict, args.out)
+    print(f"[hasslc] Package written to {args.out}")
 
     os.makedirs(args.out, exist_ok=True)
     emit_package(ir, args.out)

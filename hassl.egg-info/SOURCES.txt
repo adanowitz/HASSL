@@ -7,6 +7,7 @@ pyproject.toml
 ./hassl/ast/nodes.py
 ./hassl/codegen/__init__.py
 ./hassl/codegen/package.py
+./hassl/codegen/rules_min.py
 ./hassl/codegen/yaml_emit.py
 ./hassl/parser/__init__.py
 ./hassl/parser/transform.py
@@ -25,6 +26,7 @@ hassl/ast/__init__.py
 hassl/ast/nodes.py
 hassl/codegen/__init__.py
 hassl/codegen/package.py
+hassl/codegen/rules_min.py
 hassl/codegen/yaml_emit.py
 hassl/parser/__init__.py
 hassl/parser/transform.py

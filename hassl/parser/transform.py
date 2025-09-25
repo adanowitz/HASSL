@@ -18,6 +18,9 @@ def _atom(val):
             return s[1:-1]
     return val
 
+def _to_str(x):
+    return str(x) if not isinstance(x, Token) else str(x)
+
 @v_args(inline=True)
 class HasslTransformer(Transformer):
     def __init__(self):
@@ -69,10 +72,12 @@ class HasslTransformer(Transformer):
         return cond
 
     def qualifier(self, *args):
-        if len(args) == 1 and isinstance(args[0], str):
-            return {"not_by": args[0]}
-        if len(args) == 2 and str(args[0]) == "rule":
-            return {"not_by": {"rule": str(args[1])}}
+        # Normalize tokens to strings first
+        sargs = [str(a) for a in args]
+        if len(sargs) == 1:
+            return {"not_by": sargs[0]}
+        if len(sargs) == 2 and sargs[0] == "rule":
+            return {"not_by": {"rule": sargs[1]}}
         return {"not_by": "this"}
 
     def or_(self, left, right):  return {"op": "or", "left": left, "right": right}
@@ -109,76 +114,84 @@ class HasslTransformer(Transformer):
     def waitact(self, cond, dur, action):
         return {"type": "wait", "condition": cond, "for": dur, "then": action}
 
-        # Accept flexible args; support:
+    # Robust parse for:
     #   disable rule NAME for 3m
-    #   enable rule NAME until sunrise
+    #   enable  rule NAME until sunrise
     #   disable rule NAME
+    #   NAME for 3m           (literals dropped by Lark)
+    #   NAME 3m               (even 'for' dropped)
     def rulectrl(self, *parts):
-        # Normalize tokens -> python values
-        def norm(x):
-            from lark import Token
-            if isinstance(x, Token):
-                return str(x)
-            return x
+        from lark import Token
 
-        vals = [norm(p) for p in parts]
+        def s(x):  # normalize tokens -> str/primitive
+            return str(x) if isinstance(x, Token) else x
 
-        # op is always first ("disable" | "enable")
-        if not vals:
-            raise ValueError("rulectrl: missing op")
-        op = str(vals[0]).lower()
+        vals = [s(p) for p in parts]
 
-        # Find NAME (first CNAME after 'rule' if present; else first CNAME-ish)
+        # 1) op: scan for 'disable' | 'enable' (may be absent if Lark dropped literals)
+        op = None
+        for v in vals:
+            if isinstance(v, str) and v.lower() in ("disable", "enable"):
+                op = v.lower()
+                break
+        if not op:
+            # Sensible default (we currently only emit 'disable' from DSL examples)
+            op = "disable"
+
+        # 2) name: prefer token after literal 'rule', else first non-keyword string
         name = None
-        i = 1
-        while i < len(vals):
-            v = vals[i]
-            if isinstance(v, str) and v.lower() == "rule":
-                # next token should be the rule name
+        keywords = {"rule", "for", "until", "disable", "enable"}
+        if "rule" in [str(v).lower() for v in vals if isinstance(v, str)]:
+            rs = [i for i, v in enumerate(vals) if isinstance(v, str) and v.lower() == "rule"]
+            for i in rs:
                 if i + 1 < len(vals):
-                    name = str(vals[i + 1])
-                    i += 2
+                    name = vals[i + 1]
                     break
-            i += 1
         if name is None:
-            # fallback: first string that isn't a keyword
-            keywords = {"rule", "for", "until", "enable", "disable"}
-            for v in vals[1:]:
+            for v in vals:
                 if isinstance(v, str) and v.lower() not in keywords:
                     name = v
                     break
         if name is None:
             raise ValueError(f"rulectrl: could not determine rule name from parts={vals!r}")
 
-        # Parse tail: "for <dur>" or "until <timepoint>"
+        # 3) tail: look for "for DUR" | "until TIMEPOINT".
+        # If those literals are missing, accept a bare duration (e.g., '3m') after the name.
         payload = {}
-        # scan remaining elements after we consumed name (or after op if fallback)
+        # indices after name for scanning tail
         try:
-            tail_start = vals.index("rule") + 2
+            start_idx = vals.index(name) + 1
         except ValueError:
-            # no explicit 'rule' literal; start after op and name
-            tail_start = max(2, vals.index(name) + 1 if name in vals else 2)
+            start_idx = 1
 
-        i = tail_start
+        i = start_idx
         while i < len(vals):
-            v = str(vals[i]).lower()
-            if v == "for":
-                if i + 1 < len(vals):
-                    payload["for"] = vals[i + 1]  # duration already normalized by dur()
-                    i += 2
-                    continue
-            elif v == "until":
-                if i + 1 < len(vals):
-                    payload["until"] = vals[i + 1]  # keep as string/timepoint atom
-                    i += 2
-                    continue
+            v = vals[i]
+            vlow = str(v).lower() if isinstance(v, str) else ""
+            if vlow == "for" and i + 1 < len(vals):
+                payload["for"] = vals[i + 1]
+                i += 2
+                continue
+            if vlow == "until" and i + 1 < len(vals):
+                payload["until"] = vals[i + 1]
+                i += 2
+                continue
             i += 1
 
-        # If nothing specified, treat as immediate toggle with 0s to keep IR consistent
+        # Bare duration fallback: e.g., parts == [name, '3m']
+        if not payload:
+            # crude dur check: ends with a known unit
+            units = ("ms", "s", "m", "h", "d")
+            for v in vals[start_idx:]:
+                if isinstance(v, str) and any(v.endswith(u) for u in units):
+                    payload["for"] = v
+                    break
+
+        # If still nothing, keep IR consistent (treat as immediate toggle window)
         if not payload:
             payload["for"] = "0s"
 
         return {"type": "rule_ctrl", "op": op, "rule": str(name), **payload}
-
+    
     def tagact(self, name, val):
         return {"type": "tag", "name": str(name), "value": _atom(val)}
