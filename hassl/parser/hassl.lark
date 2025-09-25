@@ -1,5 +1,5 @@
 
-// HASSL grammar (sync members fix): entity_list accepts aliases (CNAME) or full entities
+// HASSL grammar — unified if_clause w/ optional inside/outside qualifier
 
 start: stmt*
 
@@ -7,8 +7,10 @@ stmt: alias
     | sync
     | rule
 
+// --- Aliases ---
 alias: "alias" CNAME "=" entity
 
+// --- Sync ---
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
 
 ONOFF: "onoff"
@@ -20,10 +22,12 @@ synctype: ONOFF | DIMMER | ATTRIBUTE | SHARED | ALL
 
 syncopts: "{" ("invert" ":" entity_list) "}"
 
+// --- Rules ---
+// Allow qualifier inside (...) and/or after ) — both optional
 rule: "rule" CNAME ":" if_clause+
-if_clause: "if" "(" condition ")" "then" actions
+if_clause: "if" "(" expr qualifier? ")" qualifier? "then" actions
 
-?condition: expr qualifier?
+// ---- Conditions ----
 qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
 
 ?expr: expr "||" andexpr   -> or_
@@ -44,7 +48,9 @@ operand: entity | CNAME | STATE | NUMBER | STRING
 STATE: "on" | "off"
 NUMBER: INT | SIGNED_NUMBER
 
+// ---- Actions ----
 actions: action (";" action)*
+
 action: assign
       | attr_assign
       | waitact
@@ -52,14 +58,24 @@ action: assign
       | tagact
 
 assign: CNAME "=" STATE ("for" dur)?
+
+// Attribute assignment: allow alias.attr and full entity paths
 attr_assign: CNAME "." CNAME ("." CNAME)* "." CNAME "=" NUMBER
+           | CNAME "." CNAME "=" NUMBER
 
 waitact: "wait" "(" condition "for" dur ")" action
-rulectrl: ("disable" | "enable") "rule" CNAME "for" dur
+// condition used by wait(): allow expr + optional qualifier inside the parens
+condition: expr qualifier?
+
+rulectrl: ("disable" | "enable") "rule" CNAME ("for" dur | "until" timepoint)
 tagact: "tag" CNAME "=" (STRING | CNAME | NUMBER)
 
+// Durations
 dur: INT UNIT
 UNIT: "ms" | "s" | "m" | "h" | "d"
+
+// Timepoint placeholder (kept simple)
+timepoint: CNAME
 
 // ---- Atoms ----
 entity_list: member ("," member)*
