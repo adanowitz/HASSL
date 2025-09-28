@@ -14,5 +14,5 @@ def test_golden_ir_sync_shared(tmp_path: Path):
 
     # Check the helper proxy exists and is properly named
     assert "input_boolean" in data
-    assert "hassl__ksync__onoff" in data["input_boolean"]
-    assert data["input_boolean"]["hassl__ksync__onoff"]["name"].startswith("HASSL Proxy ksync")
+    assert "hassl_ksync_onoff" in data["input_boolean"]
+    assert data["input_boolean"]["hassl_ksync_onoff"]["name"].startswith("HASSL Proxy ksync")
