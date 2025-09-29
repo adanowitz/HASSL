@@ -1,6 +1,7 @@
 import os, re, yaml
 from pathlib import Path
 
+# ----------------- slug helpers -----------------
 def _slug(s: str) -> str:
     return str(s).lower().replace(" ", "_")
 
@@ -21,6 +22,14 @@ def _entity_ctx_key(entity_id: str) -> str:
     # input_text key to hold the last context for a plain entity action
     return f"hassl_ctx_{_safe_entity(entity_id)}"
 
+def _schedule_bool(name: str) -> str:
+    return f"input_boolean.hassl_schedule_{_slug(name)}"
+
+def _rule_schedule_bool(rule_name: str) -> str:
+    return f"input_boolean.hassl_schedule_rule_{_slug(rule_name)}"
+
+
+# ----------------- utilities -----------------
 def _entity_ids_in_expr(expr):
     ids = set()
     if isinstance(expr, dict):
@@ -106,6 +115,138 @@ def _condition_to_ha(cond):
     expr = cond.get("expr", cond)
     return cv(expr)
 
+
+# ----------------- schedule helpers -----------------
+def _parse_offset(off: str) -> str:
+    """Convert +15m / -10s / +2h to +/-HH:MM:SS string for HA sun offset"""
+    if not off: return "00:00:00"
+    m = re.fullmatch(r"([+-])(\d+)(ms|s|m|h|d)", str(off).strip())
+    if not m: return "00:00:00"
+    sign, n, unit = m.group(1), int(m.group(2)), m.group(3)
+    seconds = {"ms": 0, "s": n, "m": n*60, "h": n*3600, "d": n*86400}[unit]
+    h = seconds // 3600
+    m_ = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
+
+def _time_trigger_from_spec(ts):
+    """Return a HA trigger (or list of triggers) from a time_spec dict or entity string."""
+    # time_spec can be: {"kind":"clock","value":"HH:MM"}, {"kind":"sun","event":"sunrise|sunset","offset":"+15m"},
+    # or a plain entity_id "domain.object"
+    if isinstance(ts, dict):
+        kind = ts.get("kind")
+        if kind == "clock":
+            hhmm = ts.get("value", "00:00")
+            hh, mm = hhmm.split(":")
+            at = f"{int(hh):02d}:{int(mm):02d}:00"
+            return {"platform": "time", "at": at}
+        if kind == "sun":
+            event = ts.get("event", "sunrise")
+            off = _parse_offset(ts.get("offset", "0s"))
+            trig = {"platform": "sun", "event": event}
+            if off and off != "00:00:00":
+                trig["offset"] = off
+            return trig
+        # Fallback – treat dict with stringified entity
+        val = ts.get("value")
+        if isinstance(val, str) and "." in val:
+            return {"platform": "state", "entity_id": val, "to": "on"}
+    elif isinstance(ts, str) and "." in ts:
+        return {"platform": "state", "entity_id": ts, "to": "on"}
+    # default: 00:00
+    return {"platform": "time", "at": "00:00:00"}
+
+def _end_trigger_from_spec(ts):
+    """Like _time_trigger_from_spec but choose the natural 'end' event:
+       - clock/sun → same kind at end time
+       - entity → to: 'off' """
+    if isinstance(ts, dict):
+        kind = ts.get("kind")
+        if kind == "clock":
+            hhmm = ts.get("value", "00:00")
+            hh, mm = hhmm.split(":")
+            at = f"{int(hh):02d}:{int(mm):02d}:00"
+            return {"platform": "time", "at": at}
+        if kind == "sun":
+            event = ts.get("event", "sunset")
+            off = _parse_offset(ts.get("offset", "0s"))
+            trig = {"platform": "sun", "event": event}
+            if off and off != "00:00:00":
+                trig["offset"] = off
+            return trig
+        val = ts.get("value")
+        if isinstance(val, str) and "." in val:
+            return {"platform": "state", "entity_id": val, "to": "off"}
+    elif isinstance(ts, str) and "." in ts:
+        return {"platform": "state", "entity_id": ts, "to": "off"}
+    return {"platform": "time", "at": "00:00:00"}
+
+def _emit_schedule_clause_automations(name: str, clause: dict, autos: list):
+    """
+    For a schedule clause:
+      {"type":"schedule_clause","op":"enable|disable","from": <ts>, ["to": <ts>] | ["until": <ts>]}
+    we emit two one-shot automations (start/end) that set input_boolean.hassl_schedule_<name>
+    """
+    bool_e = _schedule_bool(name)
+    op = clause.get("op", "enable").lower()
+
+    start_ts = clause.get("from")
+    end_ts = clause.get("to", clause.get("until"))
+
+    start_trig = _time_trigger_from_spec(start_ts) if start_ts is not None else None
+    end_trig   = _end_trigger_from_spec(end_ts)   if end_ts   is not None else None
+
+    # At start: set according to op
+    if start_trig:
+        autos.append({
+            "alias": f"HASSL schedule {name} start",
+            "mode": "single",
+            "trigger": [start_trig],
+            "action": [{
+                "service": "input_boolean.turn_on" if op == "enable" else "input_boolean.turn_off",
+                "target": {"entity_id": bool_e}
+            }]
+        })
+    # At end: invert
+    if end_trig:
+        autos.append({
+            "alias": f"HASSL schedule {name} end",
+            "mode": "single",
+            "trigger": [end_trig],
+            "action": [{
+                "service": "input_boolean.turn_off" if op == "enable" else "input_boolean.turn_on",
+                "target": {"entity_id": bool_e}
+            }]
+        })
+
+def _collect_schedules(ir: dict):
+    """Return (declared_schedules: dict name->list[clause], per_rule_inline: dict rule->list[clause], per_rule_use: dict rule->list[name])"""
+    declared = {}         # name -> list[clause]
+    per_rule_inline = {}  # rule_name -> list[clause]
+    per_rule_use = {}     # rule_name -> list[name]
+
+    # analyzer may or may not include top-level schedules; we also scan rule clauses
+    for rule in ir.get("rules", []):
+        rname = rule.get("name")
+        for c in rule.get("clauses", []):
+            # Inline schedules
+            if isinstance(c, dict) and c.get("type") == "schedule_inline":
+                per_rule_inline.setdefault(rname, []).extend(c.get("clauses", []))
+            # Schedule use
+            if isinstance(c, dict) and c.get("type") == "schedule_use":
+                per_rule_use.setdefault(rname, []).extend(c.get("names", []))
+
+    # Optional: top-level schedules if analyzer provided them
+    for sch in ir.get("schedules", []):
+        # expect {"name":..., "clauses":[...]}
+        nm = sch.get("name")
+        if nm:
+            declared.setdefault(nm, []).extend(sch.get("clauses", []))
+
+    return declared, per_rule_inline, per_rule_use
+
+
+# ----------------- main generate -----------------
 def generate_rules(ir, outdir):
     rules = ir.get("rules", [])
     if not rules:
@@ -116,11 +257,63 @@ def generate_rules(ir, outdir):
     # collect helper keys we must ensure exist
     ctx_inputs = set()
 
-    # ---- build automations ----
+    # --- schedules collection ---
+    declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
+
+    # Ensure helpers for declared schedule booleans (default off)
+    schedule_helpers = { _schedule_bool(nm).split(".",1)[1]: {
+        "name": f"HASSL Schedule {nm}", "initial": "off"} for nm in declared_schedules.keys()
+    }
+
+    # Build schedule automations for declared schedules
+    for nm, clauses in declared_schedules.items():
+        for cl in clauses:
+            if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
+                _emit_schedule_clause_automations(nm, cl, bundled)
+
+    # ---- build automations (rules) ----
     for rule in rules:
         rname = rule["name"]
         gate = _gate_entity(rname)
+
+        # gather schedule conditions for this rule
+        cond_schedule_entities = []
+
+        # 1) named schedules used by this rule
+        for nm in use_by_rule.get(rname, []):
+            cond_schedule_entities.append(_schedule_bool(nm))
+
+        # 2) inline schedule clauses → we compile into a per-rule schedule boolean
+        inline_clauses = inline_by_rule.get(rname, [])
+        rule_sched_bool = None
+        if inline_clauses:
+            rule_sched_bool = _rule_schedule_bool(rname)
+            # ensure helper exists (default off)
+            schedule_helpers[rule_sched_bool.split(".",1)[1]] = {
+                "name": f"HASSL Schedule (rule) {rname}",
+                "initial": "off"
+            }
+            # emit start/end automations for the rule's schedule gate
+            for cl in inline_clauses:
+                if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
+                    # rewrite target name temporally to the rule-specific bool
+                    cl2 = dict(cl)
+                    _emit_schedule_clause_automations(f"rule_{_slug(rname)}", cl2, bundled)
+            # The automations above target input_boolean.hassl_schedule_rule_<rname>
+            # because _emit_schedule_clause_automations uses the given "name";
+            # we provided "rule_<slug>" so we adjust its bool entity name accordingly.
+            # To keep the helper entity name consistent, we alias by name in emit:
+            # We will patch _emit to look up by _schedule_bool(name).
+            # Here, we simply ensure the _schedule_bool("rule_<slug>") matches rule_sched_bool.
+            # (By construction, _schedule_bool("rule_<slug>") == rule_sched_bool)
+
+            cond_schedule_entities.append(rule_sched_bool)
+
+        # Now process each clause; skip schedule_* dicts
         for idx, clause in enumerate(rule["clauses"]):
+            if isinstance(clause, dict) and clause.get("type", "").startswith("schedule_"):
+                continue  # handled above
+
             cname = f"{_slug(rname)}__{idx+1}"
             expr = clause["condition"].get("expr", {})
             actions = clause["actions"]
@@ -128,6 +321,9 @@ def generate_rules(ir, outdir):
             triggers = [{"platform": "state", "entity_id": e} for e in entities] or [{"platform": "time", "at": "00:00:00"}]
             cond_ha = _condition_to_ha(clause["condition"])
             gate_cond = {"condition": "state", "entity_id": gate, "state": "on"}
+
+            # schedule gate conditions (all must be ON)
+            sched_conds = [{"condition":"state","entity_id": e,"state":"on"} for e in cond_schedule_entities]
 
             # --- NOT_BY guard (qualifier) ---
             qual = clause.get("condition", {}).get("not_by")
@@ -191,7 +387,7 @@ def generate_rules(ir, outdir):
                 else:
                     act_list.append({"delay": "00:00:01"})
 
-            conds = [gate_cond, cond_ha]
+            conds = [gate_cond] + sched_conds + [cond_ha]
             if qual_cond:
                 conds.append(qual_cond)
 
@@ -253,7 +449,11 @@ def generate_rules(ir, outdir):
             "max": 64
         })
 
-    # 5) Write back with friendly header
+    # 5) Add schedule booleans (declared + per-rule)
+    for key, obj in schedule_helpers.items():
+        merged["input_boolean"].setdefault(key, obj)
+
+    # 6) Write back with friendly header
     header = "# Generated by HASSL codegen\n"
     helpers_yaml = yaml.safe_dump(merged, sort_keys=False)
     helpers_path.write_text(header + helpers_yaml)

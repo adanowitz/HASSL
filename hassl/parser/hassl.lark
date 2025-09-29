@@ -1,11 +1,12 @@
-
 // HASSL grammar — unified if_clause w/ optional inside/outside qualifier
+// + additive schedule support
 
 start: stmt*
 
 stmt: alias
     | sync
     | rule
+    | schedule_decl           // NEW (additive)
 
 // --- Aliases ---
 alias: "alias" CNAME "=" entity
@@ -24,7 +25,13 @@ syncopts: "{" ("invert" ":" entity_list) "}"
 
 // --- Rules ---
 // Allow qualifier inside (...) and/or after ) — both optional
-rule: "rule" CNAME ":" if_clause+
+// (augmented to allow schedule clauses inside rules)
+rule: "rule" CNAME ":" rule_clause+
+
+rule_clause: if_clause
+           | rule_schedule_use      // NEW
+           | rule_schedule_inline   // NEW
+
 if_clause: "if" "(" expr qualifier? ")" qualifier? "then" actions
 
 // ---- Conditions ----
@@ -76,6 +83,44 @@ UNIT: "ms" | "s" | "m" | "h" | "d"
 
 // Timepoint placeholder (kept simple)
 timepoint: CNAME
+
+// ---------- Schedules (additive) ----------
+SCHEDULE: "schedule"
+USE: "use"
+FROM: "from"
+TO: "to"
+UNTIL: "until"
+ENABLE: "enable"
+DISABLE: "disable"
+SUNRISE: "sunrise"
+SUNSET: "sunset"
+
+TIME_HHMM: /[0-2]?\d:[0-5]\d/
+OFFSET: /[+-]\d+(ms|s|m|h|d)/
+
+// Reusable named schedule declarations
+schedule_decl: SCHEDULE CNAME ":" schedule_clause+
+
+// Clauses usable both in declarations and inline
+schedule_clause: schedule_op FROM time_spec schedule_end? ";"
+schedule_op: ENABLE | DISABLE
+schedule_end: TO time_spec    -> schedule_to
+            | UNTIL time_spec -> schedule_until
+
+// Rule-level usage
+rule_schedule_use: SCHEDULE USE name_list ";"
+name_list: CNAME ("," CNAME)*
+
+// Inline schedule block inside a rule
+rule_schedule_inline: SCHEDULE schedule_clause+
+
+// Time specifications
+time_spec: TIME_HHMM                 -> time_clock
+         | sun_spec
+         | entity
+         | CNAME
+
+sun_spec: (SUNRISE|SUNSET) OFFSET?   -> time_sun
 
 // ---- Atoms ----
 entity_list: member ("," member)*

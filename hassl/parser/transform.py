@@ -48,8 +48,9 @@ class HasslTransformer(Transformer):
     def entity(self, *parts): return ".".join(str(p) for p in parts)
 
     # --- Rules / if_clause ---
-    def rule(self, name, *if_clauses):
-        r = nodes.Rule(name=str(name), clauses=list(if_clauses))
+    def rule(self, name, *clauses):
+        # clauses may include if_clause dicts and schedule_* dicts
+        r = nodes.Rule(name=str(name), clauses=list(clauses))
         self.stmts.append(r); return r
 
     # if_clause: "if" "(" expr qualifier? ")" qualifier? "then" actions
@@ -72,7 +73,6 @@ class HasslTransformer(Transformer):
         return cond
 
     def qualifier(self, *args):
-        # Normalize tokens to strings first
         sargs = [str(a) for a in args]
         if len(sargs) == 1:
             return {"not_by": sargs[0]}
@@ -114,31 +114,30 @@ class HasslTransformer(Transformer):
     def waitact(self, cond, dur, action):
         return {"type": "wait", "condition": cond, "for": dur, "then": action}
 
-    # Robust parse for:
+    # Robust parse for rule control:
     #   disable rule NAME for 3m
     #   enable  rule NAME until sunrise
     #   disable rule NAME
-    #   NAME for 3m           (literals dropped by Lark)
-    #   NAME 3m               (even 'for' dropped)
+    #   NAME for 3m
+    #   NAME 3m
     def rulectrl(self, *parts):
         from lark import Token
 
-        def s(x):  # normalize tokens -> str/primitive
+        def s(x):
             return str(x) if isinstance(x, Token) else x
 
         vals = [s(p) for p in parts]
 
-        # 1) op: scan for 'disable' | 'enable' (may be absent if Lark dropped literals)
+        # op
         op = None
         for v in vals:
             if isinstance(v, str) and v.lower() in ("disable", "enable"):
                 op = v.lower()
                 break
         if not op:
-            # Sensible default (we currently only emit 'disable' from DSL examples)
             op = "disable"
 
-        # 2) name: prefer token after literal 'rule', else first non-keyword string
+        # name
         name = None
         keywords = {"rule", "for", "until", "disable", "enable"}
         if "rule" in [str(v).lower() for v in vals if isinstance(v, str)]:
@@ -155,10 +154,8 @@ class HasslTransformer(Transformer):
         if name is None:
             raise ValueError(f"rulectrl: could not determine rule name from parts={vals!r}")
 
-        # 3) tail: look for "for DUR" | "until TIMEPOINT".
-        # If those literals are missing, accept a bare duration (e.g., '3m') after the name.
+        # tail
         payload = {}
-        # indices after name for scanning tail
         try:
             start_idx = vals.index(name) + 1
         except ValueError:
@@ -178,16 +175,13 @@ class HasslTransformer(Transformer):
                 continue
             i += 1
 
-        # Bare duration fallback: e.g., parts == [name, '3m']
         if not payload:
-            # crude dur check: ends with a known unit
             units = ("ms", "s", "m", "h", "d")
             for v in vals[start_idx:]:
                 if isinstance(v, str) and any(v.endswith(u) for u in units):
                     payload["for"] = v
                     break
 
-        # If still nothing, keep IR consistent (treat as immediate toggle window)
         if not payload:
             payload["for"] = "0s"
 
@@ -195,3 +189,80 @@ class HasslTransformer(Transformer):
     
     def tagact(self, name, val):
         return {"type": "tag", "name": str(name), "value": _atom(val)}
+
+    # ---- Schedules (additive) ----
+    # We keep them as plain dicts so existing analyzer/tests keep working.
+    # Decls are appended to stmts as dicts; rules get schedule_* dict clauses.
+
+    # schedule_decl: SCHEDULE CNAME ":" schedule_clause+
+    def schedule_decl(self, *_parts):
+        # children typically: Token('SCHEDULE'), CNAME, schedule_clause, schedule_clause, ...
+        parts = list(_parts)
+        # find first CNAME for the schedule name
+        name = None
+        for p in parts:
+            if isinstance(p, Token) and p.type == "CNAME":
+                name = str(p); break
+            if isinstance(p, str):
+                name = p; break
+        clauses = [c for c in parts if isinstance(c, dict) and c.get("type") == "schedule_clause"]
+        node = {"type":"schedule_decl", "name": name, "clauses": clauses}
+        self.stmts.append(node)
+        return node
+
+    # rule_schedule_use: SCHEDULE USE name_list ";"
+    def rule_schedule_use(self, *parts):
+        # parts likely: Token('SCHEDULE'), Token('USE'), names(list)
+        names = []
+        for p in parts:
+            if isinstance(p, list):
+                names = [str(x) for x in p]
+        return {"type":"schedule_use", "names": names}
+
+    # rule_schedule_inline: SCHEDULE schedule_clause+
+    def rule_schedule_inline(self, *parts):
+        # filter to our schedule_clause dicts
+        clauses = [c for c in parts if isinstance(c, dict) and c.get("type") == "schedule_clause"]
+        return {"type":"schedule_inline", "clauses": clauses}
+
+    # schedule_clause: schedule_op FROM time_spec schedule_end? ";"
+    def schedule_clause(self, op, *rest):
+        # rest ~ [time_spec, (enddict)?]
+        start = None
+        end = None
+        if rest:
+            start = rest[0]
+        if len(rest) > 1 and isinstance(rest[1], dict):
+            end = rest[1]  # {"to": {...}} or {"until": {...}}
+        d = {"type":"schedule_clause", "op": op, "from": start}
+        if end:
+            d.update(end)
+        return d
+
+    # schedule_op: ENABLE | DISABLE
+    def schedule_op(self, tok):
+        return str(tok).lower()
+
+    # schedule_end: TO time_spec -> schedule_to
+    def schedule_to(self, ts):
+        return {"to": ts}
+
+    # schedule_end: UNTIL time_spec -> schedule_until
+    def schedule_until(self, ts):
+        return {"until": ts}
+
+    # name_list: CNAME ("," CNAME)*
+    def name_list(self, *names):
+        return [str(n) for n in names]
+
+    # time_spec: TIME_HHMM | sun_spec | entity | CNAME
+    def time_clock(self, tok):
+        return {"kind":"clock", "value": str(tok)}
+
+    def time_sun(self, sun_tok, offset_tok=None):
+        event = str(sun_tok).lower()
+        off = str(offset_tok) if offset_tok is not None else "0s"
+        return {"kind":"sun", "event": event, "offset": off}
+
+    # entity already handled above → returns "domain.object"
+    # CNAME here (bare name) will come through as str by default; that’s fine.
