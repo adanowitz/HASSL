@@ -29,17 +29,21 @@ class HasslTransformer(Transformer):
 
     # --- Program / Aliases / Syncs ---
     def start(self, *stmts):
+        # We’ve been accumulating into self.stmts to preserve order.
         return nodes.Program(statements=self.stmts)
 
     def alias(self, name, entity):
         a = nodes.Alias(name=str(name), entity=str(entity))
-        self.stmts.append(a); return a
+        self.stmts.append(a)
+        return a
 
     def sync(self, synctype, members, name, syncopts=None):
         invert = []
-        if isinstance(syncopts, list): invert = syncopts
+        if isinstance(syncopts, list):
+            invert = syncopts
         s = nodes.Sync(kind=str(synctype), members=members, name=str(name), invert=invert)
-        self.stmts.append(s); return s
+        self.stmts.append(s)
+        return s
 
     def synctype(self, tok): return str(tok)
     def syncopts(self, *args): return list(args)[-1] if args else []
@@ -49,9 +53,10 @@ class HasslTransformer(Transformer):
 
     # --- Rules / if_clause ---
     def rule(self, name, *clauses):
-        # clauses may include if_clause dicts and schedule_* dicts
+        # clauses may include IfClause nodes AND schedule_* dicts (we keep both).
         r = nodes.Rule(name=str(name), clauses=list(clauses))
-        self.stmts.append(r); return r
+        self.stmts.append(r)
+        return r
 
     # if_clause: "if" "(" expr qualifier? ")" qualifier? "then" actions
     def if_clause(self, *parts):
@@ -85,7 +90,8 @@ class HasslTransformer(Transformer):
     def not_(self, term):        return {"op": "not", "value": term}
 
     def comparison(self, left, op=None, right=None):
-        if op is None: return left
+        if op is None:
+            return left
         return {"op": str(op), "left": left, "right": right}
 
     def bare_operand(self, val): return _atom(val)
@@ -101,7 +107,8 @@ class HasslTransformer(Transformer):
 
     def assign(self, name, state, *for_parts):
         act = {"type": "assign", "target": str(name), "state": str(state)}
-        if for_parts: act["for"] = for_parts[0]
+        if for_parts:
+            act["for"] = for_parts[0]
         return act
 
     def attr_assign(self, *parts):
@@ -109,21 +116,16 @@ class HasslTransformer(Transformer):
         cnames = [str(p) for p in parts[:-1]]
         attr = cnames[-1]
         entity = ".".join(cnames[:-1])
-        return {"type":"attr_assign","entity": entity, "attr": attr, "value": value}
+        return {"type": "attr_assign", "entity": entity, "attr": attr, "value": value}
 
     def waitact(self, cond, dur, action):
         return {"type": "wait", "condition": cond, "for": dur, "then": action}
 
-    # Robust parse for rule control:
-    #   disable rule NAME for 3m
-    #   enable  rule NAME until sunrise
-    #   disable rule NAME
-    #   NAME for 3m
-    #   NAME 3m
+    # Robust rule control
     def rulectrl(self, *parts):
         from lark import Token
 
-        def s(x):
+        def s(x):  # normalize tokens -> str/primitive
             return str(x) if isinstance(x, Token) else x
 
         vals = [s(p) for p in parts]
@@ -186,57 +188,35 @@ class HasslTransformer(Transformer):
             payload["for"] = "0s"
 
         return {"type": "rule_ctrl", "op": op, "rule": str(name), **payload}
-    
+
     def tagact(self, name, val):
         return {"type": "tag", "name": str(name), "value": _atom(val)}
 
-    # ---- Schedules (additive) ----
-    # We keep them as plain dicts so existing analyzer/tests keep working.
-    # Decls are appended to stmts as dicts; rules get schedule_* dict clauses.
+    # ======================
+    # Schedules (composable)
+    # ======================
 
     # schedule_decl: SCHEDULE CNAME ":" schedule_clause+
-    def schedule_decl(self, *_parts):
-        # children typically: Token('SCHEDULE'), CNAME, schedule_clause, schedule_clause, ...
-        parts = list(_parts)
-        # find first CNAME for the schedule name
-        name = None
-        for p in parts:
-            if isinstance(p, Token) and p.type == "CNAME":
-                name = str(p); break
-            if isinstance(p, str):
-                name = p; break
-        clauses = [c for c in parts if isinstance(c, dict) and c.get("type") == "schedule_clause"]
-        node = {"type":"schedule_decl", "name": name, "clauses": clauses}
+    def schedule_decl(self, _sched_kw, name, _colon, *clauses):
+        clist = [c for c in clauses if isinstance(c, dict) and c.get("type") == "schedule_clause"]
+        node = {"type": "schedule_decl", "name": str(name), "clauses": clist}
         self.stmts.append(node)
         return node
 
     # rule_schedule_use: SCHEDULE USE name_list ";"
-    def rule_schedule_use(self, *parts):
-        # parts likely: Token('SCHEDULE'), Token('USE'), names(list)
-        names = []
-        for p in parts:
-            if isinstance(p, list):
-                names = [str(x) for x in p]
-        return {"type":"schedule_use", "names": names}
+    def rule_schedule_use(self, _sched_kw, _use_kw, names, _semi=None):
+        return {"type": "schedule_use", "names": [str(n) for n in names]}
 
     # rule_schedule_inline: SCHEDULE schedule_clause+
-    def rule_schedule_inline(self, *parts):
-        # filter to our schedule_clause dicts
-        clauses = [c for c in parts if isinstance(c, dict) and c.get("type") == "schedule_clause"]
-        return {"type":"schedule_inline", "clauses": clauses}
+    def rule_schedule_inline(self, _sched_kw, *clauses):
+        clist = [c for c in clauses if isinstance(c, dict) and c.get("type") == "schedule_clause"]
+        return {"type": "schedule_inline", "clauses": clist}
 
     # schedule_clause: schedule_op FROM time_spec schedule_end? ";"
-    def schedule_clause(self, op, *rest):
-        # rest ~ [time_spec, (enddict)?]
-        start = None
-        end = None
-        if rest:
-            start = rest[0]
-        if len(rest) > 1 and isinstance(rest[1], dict):
-            end = rest[1]  # {"to": {...}} or {"until": {...}}
-        d = {"type":"schedule_clause", "op": op, "from": start}
-        if end:
-            d.update(end)
+    def schedule_clause(self, op, _from_kw, start, end=None, _semi=None):
+        d = {"type": "schedule_clause", "op": str(op), "from": start}
+        if isinstance(end, dict):
+            d.update(end)  # {"to": ...} or {"until": ...}
         return d
 
     # schedule_op: ENABLE | DISABLE
@@ -244,25 +224,27 @@ class HasslTransformer(Transformer):
         return str(tok).lower()
 
     # schedule_end: TO time_spec -> schedule_to
-    def schedule_to(self, ts):
+    def schedule_to(self, _to_kw, ts):
         return {"to": ts}
 
     # schedule_end: UNTIL time_spec -> schedule_until
-    def schedule_until(self, ts):
+    def schedule_until(self, _until_kw, ts):
         return {"until": ts}
 
     # name_list: CNAME ("," CNAME)*
     def name_list(self, *names):
         return [str(n) for n in names]
 
-    # time_spec: TIME_HHMM | sun_spec | entity | CNAME
+    # time_spec: TIME_HHMM -> time_clock
     def time_clock(self, tok):
-        return {"kind":"clock", "value": str(tok)}
+        return {"kind": "clock", "value": str(tok)}
 
-    def time_sun(self, sun_tok, offset_tok=None):
-        event = str(sun_tok).lower()
+    # sun_spec: (SUNRISE|SUNSET) OFFSET? -> time_sun
+    def time_sun(self, event_tok, offset_tok=None):
+        event = str(event_tok).lower()
         off = str(offset_tok) if offset_tok is not None else "0s"
-        return {"kind":"sun", "event": event, "offset": off}
+        return {"kind": "sun", "event": event, "offset": off}
 
-    # entity already handled above → returns "domain.object"
-    # CNAME here (bare name) will come through as str by default; that’s fine.
+    # Unwrap rule_clause so clauses list contains IfClause nodes and/or dicts
+    def rule_clause(self, item):
+        return item

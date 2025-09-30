@@ -131,8 +131,6 @@ def _parse_offset(off: str) -> str:
 
 def _time_trigger_from_spec(ts):
     """Return a HA trigger (or list of triggers) from a time_spec dict or entity string."""
-    # time_spec can be: {"kind":"clock","value":"HH:MM"}, {"kind":"sun","event":"sunrise|sunset","offset":"+15m"},
-    # or a plain entity_id "domain.object"
     if isinstance(ts, dict):
         kind = ts.get("kind")
         if kind == "clock":
@@ -220,30 +218,36 @@ def _emit_schedule_clause_automations(name: str, clause: dict, autos: list):
         })
 
 def _collect_schedules(ir: dict):
-    """Return (declared_schedules: dict name->list[clause], per_rule_inline: dict rule->list[clause], per_rule_use: dict rule->list[name])"""
-    declared = {}         # name -> list[clause]
-    per_rule_inline = {}  # rule_name -> list[clause]
-    per_rule_use = {}     # rule_name -> list[name]
+    """
+    Return:
+      declared: dict name -> list[clause]
+      inline_by_rule: dict rule_name -> list[clause]
+      use_by_rule: dict rule_name -> list[name]
+    NOTE: matches analyzer that emits:
+      ir["schedules"]               == dict{name: [clauses]}
+      rule["schedule_uses"]         == list[str]
+      rule["schedules_inline"]      == list[clause dict]
+    """
+    declared = {}
+    inline_by_rule = {}
+    use_by_rule = {}
 
-    # analyzer may or may not include top-level schedules; we also scan rule clauses
+    # top-level declared schedules
+    schedules_obj = ir.get("schedules") or {}
+    if isinstance(schedules_obj, dict):
+        declared = {str(k): (v or []) for k, v in schedules_obj.items()}
+
+    # per-rule data
     for rule in ir.get("rules", []):
         rname = rule.get("name")
-        for c in rule.get("clauses", []):
-            # Inline schedules
-            if isinstance(c, dict) and c.get("type") == "schedule_inline":
-                per_rule_inline.setdefault(rname, []).extend(c.get("clauses", []))
-            # Schedule use
-            if isinstance(c, dict) and c.get("type") == "schedule_use":
-                per_rule_use.setdefault(rname, []).extend(c.get("names", []))
+        if not rname: 
+            continue
+        if "schedule_uses" in rule and isinstance(rule["schedule_uses"], list):
+            use_by_rule[rname] = [str(n) for n in rule["schedule_uses"]]
+        if "schedules_inline" in rule and isinstance(rule["schedules_inline"], list):
+            inline_by_rule[rname] = [c for c in rule["schedules_inline"] if isinstance(c, dict)]
 
-    # Optional: top-level schedules if analyzer provided them
-    for sch in ir.get("schedules", []):
-        # expect {"name":..., "clauses":[...]}
-        nm = sch.get("name")
-        if nm:
-            declared.setdefault(nm, []).extend(sch.get("clauses", []))
-
-    return declared, per_rule_inline, per_rule_use
+    return declared, inline_by_rule, use_by_rule
 
 
 # ----------------- main generate -----------------
@@ -261,8 +265,10 @@ def generate_rules(ir, outdir):
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
 
     # Ensure helpers for declared schedule booleans (default off)
-    schedule_helpers = { _schedule_bool(nm).split(".",1)[1]: {
-        "name": f"HASSL Schedule {nm}", "initial": "off"} for nm in declared_schedules.keys()
+    schedule_helpers = {
+        _schedule_bool(nm).split(".",1)[1]: {
+            "name": f"HASSL Schedule {nm}", "initial": "off"
+        } for nm in declared_schedules.keys()
     }
 
     # Build schedule automations for declared schedules
@@ -280,11 +286,11 @@ def generate_rules(ir, outdir):
         cond_schedule_entities = []
 
         # 1) named schedules used by this rule
-        for nm in use_by_rule.get(rname, []):
+        for nm in use_by_rule.get(rname, []) or []:
             cond_schedule_entities.append(_schedule_bool(nm))
 
-        # 2) inline schedule clauses → we compile into a per-rule schedule boolean
-        inline_clauses = inline_by_rule.get(rname, [])
+        # 2) inline schedule clauses → compile into a per-rule schedule boolean
+        inline_clauses = inline_by_rule.get(rname, []) or []
         rule_sched_bool = None
         if inline_clauses:
             rule_sched_bool = _rule_schedule_bool(rname)
@@ -294,26 +300,17 @@ def generate_rules(ir, outdir):
                 "initial": "off"
             }
             # emit start/end automations for the rule's schedule gate
+            # name is "rule_<slug>" so _schedule_bool(name) == _rule_schedule_bool(rname)
+            inline_name = f"rule_{_slug(rname)}"
             for cl in inline_clauses:
                 if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
-                    # rewrite target name temporally to the rule-specific bool
-                    cl2 = dict(cl)
-                    _emit_schedule_clause_automations(f"rule_{_slug(rname)}", cl2, bundled)
-            # The automations above target input_boolean.hassl_schedule_rule_<rname>
-            # because _emit_schedule_clause_automations uses the given "name";
-            # we provided "rule_<slug>" so we adjust its bool entity name accordingly.
-            # To keep the helper entity name consistent, we alias by name in emit:
-            # We will patch _emit to look up by _schedule_bool(name).
-            # Here, we simply ensure the _schedule_bool("rule_<slug>") matches rule_sched_bool.
-            # (By construction, _schedule_bool("rule_<slug>") == rule_sched_bool)
+                    _emit_schedule_clause_automations(inline_name, cl, bundled)
 
             cond_schedule_entities.append(rule_sched_bool)
 
-        # Now process each clause; skip schedule_* dicts
+        # Now process each 'if' clause
         for idx, clause in enumerate(rule["clauses"]):
-            if isinstance(clause, dict) and clause.get("type", "").startswith("schedule_"):
-                continue  # handled above
-
+            # Each clause is {"condition": ..., "actions": [...]}
             cname = f"{_slug(rname)}__{idx+1}"
             expr = clause["condition"].get("expr", {})
             actions = clause["actions"]
