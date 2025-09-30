@@ -264,12 +264,23 @@ def generate_rules(ir, outdir):
     # --- schedules collection ---
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
 
+    # Gather all schedule names used by rules (to ensure helpers even if undeclared)
+    used_names = set()
+    for r in ir.get("rules", []):
+        for nm in (use_by_rule.get(r.get("name"), []) or []):
+            used_names.add(nm)
+
     # Ensure helpers for declared schedule booleans (default off)
     schedule_helpers = {
         _schedule_bool(nm).split(".",1)[1]: {
             "name": f"HASSL Schedule {nm}", "initial": "off"
         } for nm in declared_schedules.keys()
     }
+    # Also ensure helpers for used-but-undeclared schedules (still default off)
+    for nm in sorted(used_names - set(declared_schedules.keys())):
+        schedule_helpers[_schedule_bool(nm).split(".",1)[1]] = {
+            "name": f"HASSL Schedule {nm}", "initial": "off"
+        }
 
     # Build schedule automations for declared schedules
     for nm, clauses in declared_schedules.items():
@@ -291,7 +302,6 @@ def generate_rules(ir, outdir):
 
         # 2) inline schedule clauses → compile into a per-rule schedule boolean
         inline_clauses = inline_by_rule.get(rname, []) or []
-        rule_sched_bool = None
         if inline_clauses:
             rule_sched_bool = _rule_schedule_bool(rname)
             # ensure helper exists (default off)
@@ -299,14 +309,14 @@ def generate_rules(ir, outdir):
                 "name": f"HASSL Schedule (rule) {rname}",
                 "initial": "off"
             }
-            # emit start/end automations for the rule's schedule gate
-            # name is "rule_<slug>" so _schedule_bool(name) == _rule_schedule_bool(rname)
-            inline_name = f"rule_{_slug(rname)}"
+            inline_name = f"rule_{_slug(rname)}"  # ensures _schedule_bool(inline_name) == rule_sched_bool
             for cl in inline_clauses:
                 if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
                     _emit_schedule_clause_automations(inline_name, cl, bundled)
-
             cond_schedule_entities.append(rule_sched_bool)
+
+        # de-dup schedule conditions
+        cond_schedule_entities = sorted(set(cond_schedule_entities))
 
         # Now process each 'if' clause
         for idx, clause in enumerate(rule["clauses"]):
@@ -446,7 +456,7 @@ def generate_rules(ir, outdir):
             "max": 64
         })
 
-    # 5) Add schedule booleans (declared + per-rule)
+    # 5) Add schedule booleans (declared + per-rule + used-but-undeclared)
     for key, obj in schedule_helpers.items():
         merged["input_boolean"].setdefault(key, obj)
 

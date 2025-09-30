@@ -19,15 +19,15 @@ class IRSync:
 class IRRule:
     name: str
     clauses: List[dict]
-    schedule_uses: List[str] = None
-    schedules_inline: List[dict] = None
+    schedule_uses: Optional[List[str]] = None
+    schedules_inline: Optional[List[dict]] = None
 
 @dataclass
 class IRProgram:
     aliases: Dict[str, str]
     syncs: List[IRSync]
     rules: List[IRRule]
-    schedules: Dict[str, List[dict]] = None
+    schedules: Optional[Dict[str, List[dict]]] = None
     
     def to_dict(self):
         return {
@@ -78,13 +78,14 @@ def _props_for_sync(kind: str, members: List[str]) -> List[IRSyncedProp]:
     return []
 
 def analyze(prog: Program) -> IRProgram:
+    # --- Aliases ---
     amap: Dict[str,str] = {}
     for s in prog.statements:
-        if isinstance(s, Alias): amap[s.name]=s.entity
+        if isinstance(s, Alias):
+            amap[s.name] = s.entity
 
+    # --- Syncs ---
     syncs: List[IRSync] = []
-    rules: List[IRRule] = []
-
     for s in prog.statements:
         if isinstance(s, Sync):
             mem = [_resolve_alias(m,amap) for m in s.members]
@@ -92,64 +93,49 @@ def analyze(prog: Program) -> IRProgram:
             props = _props_for_sync(s.kind, mem)
             syncs.append(IRSync(s.name, s.kind, mem, inv, props))
 
-    for s in prog.statements:
-        if isinstance(s, Rule):
-            clauses = []
-            for c in s.clauses:
-                # Only transform IfClause-like items (schedules are dicts, ignore here)
-                if hasattr(c, "condition") and hasattr(c, "actions"):
-                    cond = _walk_alias(c.condition, amap)
-                    acts = _walk_alias(c.actions, amap)
-                    clauses.append({"condition": cond, "actions": acts})
-                else:
-                    # schedule_use / schedule_inline dicts or anything else → skip for now
-                    # (rules_min/codegen doesn't consume them yet)
-                    continue
-                
-            rules.append(IRRule(s.name, clauses))
-
+    # --- Top-level schedules (from transformer) ---
     scheds: Dict[str, List[dict]] = {}
-
     for st in prog.statements:
-        # schedule_decl comes from the transformer as a dict: {"type":"schedule_decl","name":..., "clauses":[...]}
+        # transformer emits: {"type":"schedule_decl","name":..., "clauses":[...]}
         if isinstance(st, dict) and st.get("type") == "schedule_decl":
             name = st.get("name")
             clauses = st.get("clauses", []) or []
             if isinstance(name, str) and name.strip():
-                # No alias resolution needed inside schedule clauses; they are time specs
-                scheds[name] = clauses
+                # no aliasing inside time specs
+                scheds.setdefault(name, []).extend(clauses)
 
-    # --- Rules ---
-    ir_rules: List[IRRule] = []
-    for r in [s for s in prog.statements if isinstance(s, Rule)]:
-        clauses: List[dict] = []
-        schedule_uses: List[str] = []
-        schedules_inline: List[dict] = []
+    # --- Rules (with schedule use/inline) ---
+    rules: List[IRRule] = []
+    for s in prog.statements:
+        if isinstance(s, Rule):
+            clauses: List[dict] = []
+            schedule_uses: List[str] = []
+            schedules_inline: List[dict] = []
 
-        for c in r.clauses:
-            # IfClause nodes have .condition and .actions
-            if hasattr(c, "condition") and hasattr(c, "actions"):
-                cond = _walk_alias(c.condition, amap)
-                acts = _walk_alias(c.actions, amap)
-                clauses.append({"condition": cond, "actions": acts})
-            elif isinstance(c, dict) and c.get("type") == "schedule_use":
-                # e.g. {"type":"schedule_use","names":[...]}
-                schedule_uses.extend([str(n) for n in (c.get("names") or []) if isinstance(n, str)])
-            elif isinstance(c, dict) and c.get("type") == "schedule_inline":
-                # e.g. {"type":"schedule_inline","clauses":[...]}
-                for sc in c.get("clauses") or []:
-                    if isinstance(sc, dict):
-                        schedules_inline.append(sc)
-            else:
-                # unknown clause → ignore
-                pass
+            for c in s.clauses:
+                # IfClause-like items have .condition/.actions
+                if hasattr(c, "condition") and hasattr(c, "actions"):
+                    cond = _walk_alias(c.condition, amap)
+                    acts = _walk_alias(c.actions, amap)
+                    clauses.append({"condition": cond, "actions": acts})
+                elif isinstance(c, dict) and c.get("type") == "schedule_use":
+                    # {"type":"schedule_use","names":[...]}
+                    schedule_uses.extend([str(n) for n in (c.get("names") or []) if isinstance(n, str)])
+                elif isinstance(c, dict) and c.get("type") == "schedule_inline":
+                    # {"type":"schedule_inline","clauses":[...]}
+                    for sc in c.get("clauses") or []:
+                        if isinstance(sc, dict):
+                            schedules_inline.append(sc)
+                else:
+                    # ignore unknown fragments
+                    pass
 
-        ir_rules.append(IRRule(
-            name=r.name,
-            clauses=clauses,
-            schedule_uses=schedule_uses,
-            schedules_inline=schedules_inline
-        ))
+            rules.append(IRRule(
+                name=s.name,
+                clauses=clauses,
+                schedule_uses=schedule_uses,
+                schedules_inline=schedules_inline
+            ))
 
     return IRProgram(
         aliases=amap,

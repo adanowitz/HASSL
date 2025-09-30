@@ -197,9 +197,31 @@ class HasslTransformer(Transformer):
     # ======================
 
     # schedule_decl: SCHEDULE CNAME ":" schedule_clause+
-    def schedule_decl(self, _sched_kw, name, _colon, *clauses):
-        clist = [c for c in clauses if isinstance(c, dict) and c.get("type") == "schedule_clause"]
-        node = {"type": "schedule_decl", "name": str(name), "clauses": clist}
+    def schedule_decl(self, *parts):
+        # parts may look like:
+        #   (Token('SCHEDULE','schedule'), Token('CNAME','wake_hours'), <clause>...)
+        # or, depending on Lark settings, possibly without the SCHEDULE token.
+        idx = 0
+
+        # Skip leading SCHEDULE token if present
+        if idx < len(parts) and isinstance(parts[idx], Token) and parts[idx].type == "SCHEDULE":
+            idx += 1
+
+        # Grab the name (must be CNAME)
+        if idx >= len(parts):
+            raise ValueError("schedule_decl: missing schedule name")
+        name_tok = parts[idx]
+        name = str(name_tok)
+        idx += 1
+        
+        # Some setups might surface ':' as a token—skip if present
+        if idx < len(parts) and isinstance(parts[idx], Token) and str(parts[idx]) == ":":
+            idx += 1
+            
+            # Remaining items are (already-transformed) schedule_clause dicts
+        clauses = [c for c in parts[idx:] if isinstance(c, dict) and c.get("type") == "schedule_clause"]
+            
+        node = {"type": "schedule_decl", "name": name, "clauses": clauses}
         self.stmts.append(node)
         return node
 
