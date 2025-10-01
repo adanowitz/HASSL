@@ -1,5 +1,5 @@
 from typing import Dict, List
-import os
+import os, re
 from ..semantics.analyzer import IRProgram, IRSync
 from .yaml_emit import _dump_yaml, ensure_dir
 
@@ -40,6 +40,11 @@ PROP_CONFIG = {
 
 def _safe(name: str) -> str:
     return name.replace(".", "_")
+
+def _pkg_slug(outdir: str) -> str:
+    base = os.path.basename(os.path.abspath(outdir))
+    s = re.sub(r'[^a-z0-9]+', '_', base.lower()).strip('_')
+    return s or "pkg"
 
 def _proxy_entity(sync_name: str, prop: str) -> str:
     return (f"input_boolean.hassl_{_safe(sync_name)}_onoff" if prop == "onoff"
@@ -128,7 +133,7 @@ def emit_package(ir: IRProgram, outdir: str):
             else:
                 cfg = PROP_CONFIG.get(prop, {}); attr = cfg.get("upstream", {}).get("attr", prop)
                 for m in s.members:
-                    triggers.append({"platform": "template", "value_template": "{{ state_attr('%s','%s') }}" % (m, attr)})
+                    triggers.append({"platform": "state", "value_template": "{{ state_attr('%s','%s') }}" % (m, attr)})
                 conditions.append({"condition":"template","value_template":"{{ trigger.to_state.context.parent_id != states('%s') }}" % _context_entity("{{ trigger.entity_id }}", prop)})
                 proxy_e = _proxy_entity(s.name, prop)
                 if prop in ("mute",):
@@ -180,12 +185,13 @@ def emit_package(ir: IRProgram, outdir: str):
                     ]}]})
                 automations.append({"alias": f"HASSL sync {s.name} downstream {prop}","mode":"queued","max":10,"trigger": trigger,"action": actions})
 
+    pkg = _pkg_slug(outdir)
     # Write helpers.yaml / scripts.yaml
-    _dump_yaml(os.path.join(outdir, "helpers.yaml"), helpers, ensure_sections=True)
-    _dump_yaml(os.path.join(outdir, "scripts.yaml"), scripts)
+    _dump_yaml(os.path.join(outdir, f"helpers__{pkg}.yaml"), helpers, ensure_sections=True)
+    _dump_yaml(os.path.join(outdir, f"scripts_{pkg}.yaml"), scripts)
 
     # Write automations per sync
     for s in ir.syncs:
         doc = [a for a in automations if a["alias"].startswith(f"HASSL sync {s.name}")]
         if doc:
-            _dump_yaml(os.path.join(outdir, f"sync_{_safe(s.name)}.yaml"), {"automation": doc})
+            _dump_yaml(os.path.join(outdir, f"sync__{pkg}__{_safe(s.name)}.yaml"), {"automation": doc})
