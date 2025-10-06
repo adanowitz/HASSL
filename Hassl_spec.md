@@ -1,6 +1,7 @@
-# HASSL Language Specification
+# HASSL Language Specification (v1.4 – 2025 Edition)
 
-This document describes the grammar, semantics, and usage examples of **HASSL** (Home Assistant Simple Scripting Language).
+This document describes the grammar, semantics, and runtime model for  
+**HASSL** — the *Home Assistant Simple Scripting Language.*
 
 ---
 
@@ -9,31 +10,42 @@ This document describes the grammar, semantics, and usage examples of **HASSL** 
 ```ebnf
 program        = { statement } ;
 
-statement      = alias_stmt | sync_stmt | rule_stmt ;
+statement      = alias_stmt | sync_stmt | rule_stmt | schedule_decl ;
 
+# --- Aliases ---
 alias_stmt     = "alias" ident "=" entity ;
 
+# --- Syncs ---
 sync_stmt      = "sync" sync_type "[" entity_list "]" "as" ident [ sync_opts ] ;
 sync_type      = "onoff" | "dimmer" | "attribute" | "shared" | "all" ;
-sync_opts      = "{" [ sync_opt { ";" sync_opt } ] "}" ;
-sync_opt       = "invert" ":" entity_list ;
+sync_opts      = "{" [ "invert" ":" entity_list ] "}" ;
 
 entity_list    = entity { "," entity } ;
 
-rule_stmt      = "rule" ident ":" { if_clause } ;
-if_clause      = "if" "(" condition ")" "then" actions ;
+# --- Rules ---
+rule_stmt      = "rule" ident ":" { rule_clause } ;
+rule_clause    = if_clause | rule_schedule_use | rule_schedule_inline ;
 
-condition      = expression [ qualifier ] ;
-qualifier      = "not_by" ( "this" | "any_hassl" | "rule(" ident ")" ) ;
+if_clause      = "if" "(" expression [ qualifier ] ")" [ qualifier ] "then" actions ;
 
-actions        = action { ";" action } ;
-action         = assignment | wait_action | rule_ctrl | tag_action ;
+rule_schedule_use    = "schedule" "use" ident_list ";" ;
+rule_schedule_inline = "schedule" schedule_clause+ ;
 
-assignment     = ident "=" state [ "for" duration ] ;
-wait_action    = "wait" "(" condition "for" duration ")" action ;
-rule_ctrl      = ("disable" | "enable") "rule" ident "for" duration ;
-tag_action     = "tag" ident "=" value ;
+ident_list     = ident { "," ident } ;
 
+# --- Schedules ---
+schedule_decl  = "schedule" ident ":" schedule_clause+ ;
+schedule_clause = schedule_op "from" time_spec [ schedule_end ] ";" ;
+schedule_op    = "enable" | "disable" ;
+schedule_end   = "to" time_spec | "until" time_spec ;
+
+time_spec      = time_clock | time_sun | entity | ident ;
+time_clock     = time_hhmm ;
+time_hhmm      = /[0-2]?\d:[0-5]\d/ ;
+time_sun       = ("sunrise" | "sunset") [ offset ] ;
+offset         = /[+-]\d+(ms|s|m|h|d)/ ;
+
+# --- Expressions ---
 expression     = or_expr ;
 or_expr        = and_expr { "||" and_expr } ;
 and_expr       = unary_expr { "&&" unary_expr } ;
@@ -44,7 +56,23 @@ unary_expr     = "!" unary_expr
 comparison     = operand ( "==" | "!=" | "<" | ">" | "<=" | ">=" ) value
                | operand ;
 
-entity         = ident ( "." ident )+ ;
+operand        = entity | ident | state | number | string ;
+
+# --- Actions ---
+actions        = action { ";" action } ;
+action         = assignment | attr_assign | wait_action | rule_ctrl | tag_action ;
+
+assignment     = ident "=" state [ "for" duration ] ;
+attr_assign    = entity "." ident "=" number
+               | entity "." ident "=" ident
+               | entity "." ident "=" string ;
+
+wait_action    = "wait" "(" condition "for" duration ")" action ;
+rule_ctrl      = ("disable" | "enable") "rule" ident ("for" duration | "until" time_spec) ;
+tag_action     = "tag" ident "=" (string | number | ident) ;
+
+# --- Atoms ---
+entity         = ident "." ident { "." ident } ;
 ident          = letter { letter | digit | "_" } ;
 state          = "on" | "off" ;
 duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
@@ -52,168 +80,219 @@ duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
 
 ---
 
-## 🔧 Semantics
+## ⚙️ Semantics Overview
 
-### Aliases
-
+### 🧩 **Aliases**
 ```hassl
-alias light = light.living
-alias motion = binary_sensor.hall_motion
-alias lux    = sensor.living_luminance
+alias light  = light.wesley_lamp
+alias motion = binary_sensor.wesley_motion_motion
+alias lux    = sensor.wesley_motion_illuminance
 ```
-
-- Aliases are compile-time shorthands for entity IDs.
-- After alias expansion, all rules and syncs work on full entity IDs.
+- Compile-time substitution for entities.
+- Simplifies long entity IDs.
+- Aliases are expanded before parsing rules or syncs.
 
 ---
 
-### Sync
-
+### 🔄 **Syncs**
 ```hassl
-sync onoff [light.kitchen, switch.floor] as circuit
-sync shared [light.kitchen, switch.floor] as shared_sync
-sync all [light.desk, light.strip, switch.floor] as mixed_sync { invert: switch.floor }
+sync shared [light.desk, light.strip, light.lamp] as work_sync
+sync all [light.kitchen, switch.kitchen_circuit] as kitchen_sync
+sync dimmer [light.desk, light.strip] as office_sync { invert: light.strip }
 ```
 
-#### Properties synchronized
-- **onoff** → binary state only  
-- **dimmer** → on/off + brightness (and color temp if supported by both)  
-- **shared** → properties supported by *all* entities in the group  
-- **all** → properties supported by *at least two* entities in the group  
-- **invert** (optional) → reverses `on ↔ off` for listed entities (onoff only)
+#### Supported kinds
+| Type        | Behavior |
+|--------------|-----------|
+| `onoff`      | Sync binary state only. |
+| `dimmer`     | Sync on/off + brightness + optional color_temp. |
+| `shared`     | Sync all attributes shared across *all* members. |
+| `all`        | Sync attributes present in *at least two* members. |
 
-#### Execution model
-For each synchronized property:
-1. **Devices → Proxy**
-   - Trigger when a device’s property changes.
-   - Guarded with **implied `not_by this`**: ignores changes caused by the sync itself.
-   - Updates the proxy helper (`input_boolean` or `input_number`).
+#### Features
+- **invert** option reverses on/off for specified members.
+- **Context-aware** — uses HA’s `context.id` for loop prevention.
+- **Automatically creates** matching helpers (`input_boolean`, `input_number`, `input_text`).
 
-2. **Proxy → Devices**
-   - Trigger when the proxy changes.
-   - For each member whose value differs, call a **writer script** to set the new value.
-   - Writer scripts stamp context IDs so the upstream guard can recognize their origin.
+#### Upstream (device → proxy)
+- Trigger on any device attribute change.
+- Update proxy helper **only if change did not originate from HASSL**.
+- Mode: `restart` (latest state wins).
 
-#### Guarantees
-- **Loop-safe:** No feedback or infinite toggles (`not_by this` is implied).
-- **Idempotent:** Devices are only written if their state differs from proxy.
-- **Last-write-wins:** Upstream automations use `mode: restart` so the newest event dominates.
+#### Downstream (proxy → devices)
+- Trigger on proxy helper change.
+- For each member whose value differs, call a **writer script** to set the new value.
+- Writer scripts stamp context IDs so the upstream guard can recognize their origin.
 
 ---
 
-### Rules
-
+### 🧠 **Rules**
 ```hassl
-rule motion_on_light:
-  if (light == off && motion && lux < 50)
-  then light = on for 10m
+rule motion_light:
+  if (motion && lux < 50) then light = on;
+  wait (!motion for 10m) light = off
 ```
 
-#### Conditions
-- Evaluated when any referenced entity changes.
-- Boolean operators: `&&`, `||`, `!`
-- Comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`
+#### Components
+- **Conditions:** standard boolean logic (`&&`, `||`, `!`, comparisons)
+- **Actions:** `assignment`, `attr_assign`, `wait`, `rule_ctrl`, `tag`
+- **Qualifiers:**  
+  - `not_by this` → ignore self-triggered writes  
+  - `not_by rule("other")` → ignore another rule’s writes  
+  - `not_by any_hassl` → ignore all HASSL writes  
 
-#### Qualifiers
-- `not_by this` → event not caused by this rule’s last write  
-- `not_by rule("name")` → event not caused by the named rule  
-- `not_by any_hassl` → event not caused by any HASSL-generated write  
-
-#### Actions
-- **Assignment**:  
-  `light = on for 10m`  
-  Turns entity on; auto-reverts after 10 minutes (cancelled if rule restarts).
-- **Wait**:  
-  `wait (!motion for 1h) light = off`  
-  Suspends until condition holds continuously for the duration, then executes.
-- **Rule control**:  
-  `disable rule motion_on_light for 3m`  
-  Toggles rule enable flags via helpers.
-- **Tags**:  
-  `tag override = "manual"`  
-  Stores metadata in a helper.
+#### Example with qualifier
+```hassl
+rule landing_manual_off:
+  if (light == off) not_by any_hassl
+  then disable rule motion_light for 3m
+```
 
 ---
 
-### Waits
-
+### ⏳ **Waits**
 ```hassl
-rule switch_keep_on:
-  if (light == on not_by any_hassl)
-  then wait (!motion for 1h) light = off
+wait (!motion for 10m) light = off
 ```
-
-- Compiled to HA `wait_for_trigger` blocks.
-- Enforces a continuous period of the condition holding true.
+- Compiled to HA `wait_for_trigger` with duration.
+- Interrupts if rule restarts before completion.
+- Common for occupancy or timeout logic.
 
 ---
 
-### Rule Control
-
-```hassl
-rule switch_off_disable_motion:
-  if (light transitions off not_by this)
-  then disable rule motion_on_light for 3m
+### 🔒 **Rule Control**
+Each rule compiles to:
+```yaml
+input_boolean.hassl_gate_<rule_name>
 ```
+Used to globally enable/disable rule activity.
 
-- Each rule has an enable flag (`input_boolean.hassl_rule__<name>__enabled`).
-- Conditions include a check for the flag.
-- `disable`/`enable` rules toggle these flags for the given duration.
+Actions:
+```hassl
+disable rule motion_light for 3m
+enable rule night_scene for 1h
+```
 
 ---
 
-### Tags
-
+### 🏷 **Tags**
 ```hassl
-if (light == on not_by any_hassl) then tag override = "manual"
+tag override = "manual"
 ```
-
-- Tags are stored in helpers (`input_text.hassl_tag__<name>`).
-- Can be read by other automations or used for debugging.
+- Stored as `input_text.hassl_tag_<name>`.
+- Useful for tracking manual overrides or context.
 
 ---
 
-## ⚙️ Execution Guarantees
+### 🕒 **Schedules**
+Schedules are first-class gates controlling automation availability.
 
-- **Loop-safety:** All sync flows ignore their own writes (via context IDs).  
-- **Race resistance:** Last external change wins; fan-out is idempotent.  
-- **Determinism:** Conditions and waits are re-evaluated only when relevant entities change.  
-- **Isolation:** Rules can be temporarily disabled/enabled, without affecting others.
+#### Top-level schedule declarations
+```hassl
+schedule wake_hours:
+  enable from 08:00 until 19:00;
+```
+
+Creates:
+- `input_boolean.hassl_schedule_wake_hours`
+- Automations that:
+  - Turn it ON at 08:00
+  - Turn it OFF at 19:00
+  - Maintain state correctly on restart or mid-day install
+
+#### Inline rule schedules
+```hassl
+rule motion_light:
+  schedule enable from sunset to sunrise;
+  if (motion && lux < 50) then light = on
+```
+
+Creates a per-rule schedule gate:
+- `input_boolean.hassl_schedule_rule_motion_light`
+- Rule triggers only when the gate is ON.
+
+#### Reuse schedules
+```hassl
+rule wesley_motion_light:
+  schedule use wake_hours;
+  if (motion && lux < 50) then light = on;
+  wait (!motion for 10m) light = off
+```
+
+Each referenced schedule acts as an extra `condition: state` gate in Home Assistant.
 
 ---
 
-## ✅ Worked Examples
-
-### Motion + Lux + Override
-
+### 💡 **Attribute Assignments**
 ```hassl
-alias light  = light.living
-alias motion = binary_sensor.hall_motion
-alias lux    = sensor.living_luminance
-
-rule motion_on_light:
-  if (light == off && motion && lux < 50)
-  then light = on for 10m
-
-rule switch_keep_on:
-  if (light == on not_by any_hassl)
-  then wait (!motion for 1h) light = off
-
-rule switch_off_disable_motion:
-  if (light transitions off not_by any_hassl)
-  then disable rule motion_on_light for 3m
+light.brightness = 255
+light.kelvin = 2700
 ```
 
-### Sync a light with its switch (same circuit)
+#### Supported targets
+- `brightness` → numeric 0–255  
+- `color_temp` → mireds  
+- `kelvin` → Kelvin, auto-converted to `color_temp` for compatibility  
+- `color_temp_kelvin` → synonym for `kelvin`  
 
-```hassl
-sync shared [light.living, switch.living_circuit] as living_sync
+When `kelvin` is used, HASSL emits both:
+```yaml
+service: light.turn_on
+data:
+  kelvin: 2700
+  color_temp: 370  # for backward compatibility
 ```
 
-### Mixed devices with inversion
+---
+
+## ⚙️ **Runtime Guarantees**
+
+| Guarantee | Description |
+|------------|--------------|
+| **Loop-safe** | Every automation stamps its context to prevent self-retriggering. |
+| **Restart-safe** | Schedule booleans re-evaluate on HA start or every minute. |
+| **Deterministic** | Evaluations occur only when dependencies change. |
+| **Composable** | Rules, syncs, and schedules can coexist without cross-collision. |
+| **Human-readable** | Generated YAML uses consistent names: `hassl_<scope>_<name>_<attr>` |
+
+---
+
+## ✅ **End-to-End Example**
 
 ```hassl
-sync all [light.desk, light.strip, light.lamp] as work_sync { invert: light.lamp }
+alias light  = light.wesley_lamp
+alias motion = binary_sensor.wesley_motion_motion
+alias lux    = sensor.wesley_motion_illuminance
+
+schedule wake_hours:
+  enable from 08:00 until 19:00;
+
+rule wesley_motion_light:
+  schedule use wake_hours;
+  if (motion && lux < 50)
+  then light = on;
+  wait (!motion for 10m) light = off
+
+rule landing_manual_off:
+  if (light == off) not_by any_hassl
+  then disable rule wesley_motion_light for 3m
 ```
 
-This keeps brightness and color in sync across the lights, while `light.lamp` has inverted on/off behavior.
+Generates:
+- ✅ Schedules that track real time and restart cleanly.  
+- ✅ Context-aware automations for motion logic.  
+- ✅ A gate toggle (`input_boolean.hassl_gate_wesley_motion_light`) to disable logic for manual use.
+
+---
+
+## 🚀 **Versioning & Backward Compatibility**
+
+| Feature | Introduced | Notes |
+|----------|-------------|-------|
+| `sync all` / `shared` | v1.0 | Multi-device synchronization |
+| `not_by` guards | v1.1 | Context-safe rule evaluation |
+| `wait (...)` blocks | v1.2 | Continuous state waits |
+| `schedule` blocks | v1.3 | Declarative time-of-day gating |
+| `kelvin` support | v1.4 | Native + color_temp fallback |
+| `restart maintenance` for schedules | v1.4 | Evaluates schedule booleans at startup |
+
