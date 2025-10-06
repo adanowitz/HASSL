@@ -28,6 +28,24 @@ def _schedule_bool(name: str) -> str:
 def _rule_schedule_bool(rule_name: str) -> str:
     return f"input_boolean.hassl_schedule_rule_{_slug(rule_name)}"
 
+def _pkg_slug(outdir: str) -> str:
+    base = os.path.basename(os.path.abspath(outdir))
+    s = re.sub(r'[^a-z0-9]+', '_', base.lower()).strip('_')
+    return s or "pkg"
+
+def _ctx_key_and_entity(entity_id: str, attr: str | None = None):
+    """
+    Build the input_text key (without domain), its full entity_id, and a
+    nice display label for stamping the parent context id used by NOT_BY
+    guards.
+    """
+    if attr:
+        key = f"hassl_ctx_{_safe_entity(entity_id)}_{attr}"
+        label = f"{entity_id} {attr}"
+    else:
+        key = f"hassl_ctx_{_safe_entity(entity_id)}"
+        label = f"{entity_id}"
+    return key, f"input_text.{key}", label
 
 # ----------------- utilities -----------------
 def _entity_ids_in_expr(expr):
@@ -54,6 +72,17 @@ def _dur_to_hms(s):
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _kelvin_to_mireds(k):
+    """Convert Kelvin → mireds (rounded, clamped >=1)."""
+    try:
+        v = float(k)
+        if v <= 0:
+            return 153  # safe-ish default (~6500K) if bad input
+        m = int(round(1000000.0 / v))
+        return m if m >= 1 else 1
+    except Exception:
+        return 153
 
 def _expr_to_template(node):
     def j(n):
@@ -179,6 +208,95 @@ def _end_trigger_from_spec(ts):
         return {"platform": "state", "entity_id": ts, "to": "off"}
     return {"platform": "time", "at": "00:00:00"}
 
+def _clock_between_cond(hhmm_start: str, hhmm_end: str):
+    """
+    Build a HA template condition that is true when current time (HH:MM) is within [start, end),
+    correctly handling wrap-past-midnight (e.g., 22:00..06:00).
+    """
+    # zero-padded strings compare lexicographically
+    # in_window = (S <= now < E) if S < E
+    #           = (now >= S) or (now < E) if S >= E  (wrap)
+    return {
+        "condition": "template",
+        "value_template": (
+            "{% set now_s = now().strftime('%H:%M') %}"
+            f"{{% set s = '{hhmm_start}' %}}{{% set e = '{hhmm_end}' %}}"
+            "{{ (s < e and (now_s >= s and now_s < e)) "
+            "or (s >= e and (now_s >= s or now_s < e)) }}"
+        )
+    }
+
+def _sun_edge_cond(edge: str, ts: dict):
+    """
+    Build a HA 'sun' condition edge ('after' or 'before') from a sun time_spec dict.
+    """
+    event = ts.get("event", "sunrise")
+    off = _parse_offset(ts.get("offset", "0s"))
+    cond = {"condition": "sun", edge: event}
+    if off and off != "00:00:00":
+        cond["offset"] = off
+    return cond
+
+def _window_condition_from_specs(start_ts, end_ts):
+    """
+    Return a HA condition dict that is true when 'now' is inside the window [start, end),
+    supporting clock and sun specs, including wrap across midnight.
+    Mixed (clock ↔ sun) windows fall back to a simple minute template using next events.
+    """
+    # Clock → Clock
+    if isinstance(start_ts, dict) and start_ts.get("kind") == "clock" and \
+       isinstance(end_ts, dict) and end_ts.get("kind") == "clock":
+        s = start_ts.get("value", "00:00")
+        e = end_ts.get("value", "00:00")
+        return _clock_between_cond(s, e)
+
+    # Sun → Sun
+    if isinstance(start_ts, dict) and start_ts.get("kind") == "sun" and \
+       isinstance(end_ts, dict) and end_ts.get("kind") == "sun":
+        # If the window wraps overnight (e.g., sunset..sunrise), we use OR(after start, before end)
+        # Otherwise AND(after start, before end)
+        after_start = _sun_edge_cond("after", start_ts)
+        before_end  = _sun_edge_cond("before", end_ts)
+        # Heuristic: sunset..sunrise wraps; sunrise..sunset doesn't.
+        wrap = (start_ts.get("event") == "sunset" and end_ts.get("event") == "sunrise")
+        if wrap:
+            return {"condition": "or", "conditions": [after_start, before_end]}
+        return {"condition": "and", "conditions": [after_start, before_end]}
+
+    # Mixed (clock ↔ sun) → fall back to a template that compares minute-of-day
+    # We approximate sun edge minutes with next/prev sun events; evaluated each minute.
+    # This keeps things robust after restarts without complex math.
+    return {
+        "condition": "template",
+        "value_template": (
+            "{% set now_m = now().hour*60 + now().minute %}"
+            "{% macro tod(hhmm) %}{% set h=hhmm[0:2]|int %}{% set m=hhmm[3:5]|int %}{{ h*60+m }}{% endmacro %}"
+            "{% set s_m = ("
+            "{% if start.kind == 'clock' %}"
+            "  tod(start.value)"
+            "{% else %}"
+            "  (as_local(state_attr('sun.sun', 'next_' + start.event)).hour*60 + "
+            "   as_local(state_attr('sun.sun', 'next_' + start.event)).minute) "
+            "{% endif %}"
+            ") %}"
+            "{% set e_m = ("
+            "{% if end.kind == 'clock' %}"
+            "  tod(end.value)"
+            "{% else %}"
+            "  (as_local(state_attr('sun.sun', 'next_' + end.event)).hour*60 + "
+            "   as_local(state_attr('sun.sun', 'next_' + end.event)).minute) "
+            "{% endif %}"
+            ") %}"
+            "{{ (s_m < e_m and (now_m >= s_m and now_m < e_m)) "
+            "or (s_m >= e_m and (now_m >= s_m or now_m < e_m)) }}"
+        ),
+        "variables": {
+            "start": start_ts or {},
+            "end": end_ts or {},
+        }
+    }
+
+
 def _emit_schedule_clause_automations(name: str, clause: dict, autos: list):
     """
     For a schedule clause:
@@ -214,6 +332,40 @@ def _emit_schedule_clause_automations(name: str, clause: dict, autos: list):
             "action": [{
                 "service": "input_boolean.turn_off" if op == "enable" else "input_boolean.turn_on",
                 "target": {"entity_id": bool_e}
+            }]
+        })
+
+    # --- Maintenance / initializer ---
+    # Ensure correct state after HA restart and when package is added mid-day.
+    # We evaluate every minute and on start.
+    if start_ts is not None and end_ts is not None:
+        in_window_cond = _window_condition_from_specs(start_ts, end_ts)
+        # If op == enable → ON inside window, OFF outside; if op == disable → inverted.
+        autos.append({
+            "alias": f"HASSL schedule {name} maintain",
+            "mode": "single",
+            "trigger": [
+                {"platform": "homeassistant", "event": "start"},
+                {"platform": "time_pattern", "minutes": "/1"}
+            ],
+            "condition": [],
+            "action": [{
+                "choose": [
+                    {
+                        "conditions": [in_window_cond],
+                        "sequence": [{
+                            "service": "input_boolean.turn_on" if op == "enable" else "input_boolean.turn_off",
+                            "target": {"entity_id": bool_e}
+                        }]
+                    },
+                    {
+                        "conditions": [{"condition": "not", "conditions": [in_window_cond]}],
+                        "sequence": [{
+                            "service": "input_boolean.turn_off" if op == "enable" else "input_boolean.turn_on",
+                            "target": {"entity_id": bool_e}
+                        }]
+                    }
+                ]
             }]
         })
 
@@ -259,7 +411,7 @@ def generate_rules(ir, outdir):
 
     bundled = []
     # collect helper keys we must ensure exist
-    ctx_inputs = set()
+    ctx_inputs = {}
 
     # --- schedules collection ---
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
@@ -341,7 +493,7 @@ def generate_rules(ir, outdir):
                     if isinstance(qual, dict) and "rule" in qual:
                         rname_qual = _slug(str(qual["rule"]))
                         it_key = _rule_ctx_key(rname_qual, ent0)
-                        ctx_inputs.add(it_key)
+                        ctx_inputs[it_key] = ent0
                         qual_cond = {
                             "condition": "template",
                             "value_template": "{{ trigger.to_state.context.parent_id != "
@@ -349,7 +501,7 @@ def generate_rules(ir, outdir):
                         }
                     else:
                         it_key = _entity_ctx_key(ent0)
-                        ctx_inputs.add(it_key)
+                        ctx_inputs[it_key] = ent0
                         qual_cond = {
                             "condition": "template",
                             "value_template": "{{ trigger.to_state.context.parent_id != "
@@ -361,11 +513,47 @@ def generate_rules(ir, outdir):
                 if act["type"] == "assign":
                     eid = act["target"]
                     service = "turn_on" if act["state"] == "on" else "turn_off"
+
+                    # stamp parent context so NOT_BY can ignore our own writes
+                    _k, _e, _label = _ctx_key_and_entity(eid, None)
+                    ctx_inputs[_k] = _label
+                    act_list.append({
+                        "service": "input_text.set_value",
+                        "data": {"entity_id": _e, "value": "{{ this.context.id }}"}
+                    })
                     act_list.append({"service": f"homeassistant.{service}", "target": {"entity_id": eid}})
                 elif act["type"] == "attr_assign":
                     eid = act["entity"]; attr = act["attr"]; val = act["value"]
+                    # stamp parent context (attr-specific)
+                    _k, _e, _label = _ctx_key_and_entity(eid, attr)
+                    ctx_inputs[_k] = _label
+                    act_list.append({
+                        "service": "input_text.set_value",
+                        "data": {"entity_id": _e, "value": "{{ this.context.id }}"}
+                    })
                     if attr == "brightness":
                         act_list.append({"service": "light.turn_on", "target": {"entity_id": eid}, "data": {"brightness": val}})
+                    elif attr == "kelvin":
+                        # Prefer native kelvin with a color_temp fallback for older integrations
+                        if isinstance(val, (int, float)):
+                            act_list.append({
+                                "service": "light.turn_on",
+                                "target": {"entity_id": eid},
+                                "data": {
+                                    "kelvin": val,
+                                    "color_temp": _kelvin_to_mireds(val)
+                                }
+                            })
+                        else:
+                            # If someone ever passes a non-numeric here, still try to emit both
+                            # (mireds computed by HA/Jinja would require templating; keep it simple)
+                            act_list.append({
+                                "service": "light.turn_on",
+                                "target": {"entity_id": eid},
+                                "data": {
+                                    "kelvin": val
+                                }
+                            })
                     else:
                         act_list.append({"service": "homeassistant.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
                 elif act["type"] == "wait":
@@ -376,6 +564,13 @@ def generate_rules(ir, outdir):
                     if inner["type"] == "assign":
                         eid = inner["target"]
                         service = "turn_on" if inner["state"] == "on" else "turn_off"
+                        # stamp parent context for the inner action
+                        _k, _e, _label = _ctx_key_and_entity(eid, None)
+                        ctx_inputs[_k] = _label
+                        act_list.append({
+                            "service": "input_text.set_value",
+                            "data": {"entity_id": _e, "value": "{{ this.context.id }}"}
+                        })
                         act_list.append({"service": f"homeassistant.{service}", "target": {"entity_id": eid}})
                 elif act["type"] == "rule_ctrl":
                     target_rule = act["rule"]
@@ -408,14 +603,16 @@ def generate_rules(ir, outdir):
             }
             bundled.append(auto)
 
-    out_path = Path(outdir) / "rules__bundled.yaml"
+    pkg = _pkg_slug(outdir)
+
+    out_path = Path(outdir) / f"rules_bundled_{pkg}.yaml"
     with open(out_path, "w") as f:
         # packages expect a mapping, not a bare list
         yaml.safe_dump({"automation": bundled}, f, sort_keys=False)
 
-    helpers_path = Path(outdir) / "helpers.yaml"
+    helpers_path = Path(outdir) / f"helpers_{pkg}.yaml"
 
-    # 1) Build our gate booleans from rule names & rule_ctrl targets
+    # --- Build gate names from rules & rule_ctrl targets (preserve original names for display)
     gate_names = {rule["name"] for rule in rules}
     for rule in rules:
         for clause in rule.get("clauses", []):
@@ -423,10 +620,7 @@ def generate_rules(ir, outdir):
                 if act.get("type") == "rule_ctrl" and "rule" in act:
                     gate_names.add(act["rule"])
 
-    gates = {f"input_boolean.hassl_gate_{_slug(name)}"
-             for name in gate_names if isinstance(name, str) and name.strip()}
-
-    # 2) Load existing helpers (if any), or start with skeleton
+    # Load existing helpers if present
     if helpers_path.exists():
         try:
             existing = yaml.safe_load(helpers_path.read_text()) or {}
@@ -441,26 +635,27 @@ def generate_rules(ir, outdir):
         "input_number": existing.get("input_number", {}) or {},
     }
 
-    # 3) Merge our gate booleans
-    for g in sorted(gates):
-        key = g.split(".", 1)[1]
+    # 3) Merge our gate booleans using the original rule name for display
+    for name in sorted(n for n in gate_names if isinstance(n, str) and n.strip()):
+        key = f"hassl_gate_{_slug(name)}"
         merged["input_boolean"][key] = {
-            "name": f"HASSL Gate {key}",
-            "initial": "on",
-        }
+        "name": f"HASSL Gate {name}",
+        "initial": "on",
+    }
 
-    # 4) Ensure input_text helpers referenced by NOT_BY guards exist
-    for it_key in sorted(ctx_inputs):
+    # 4) Ensure input_text helpers referenced by NOT_BY guards *and* context stamps exist
+    #    (ctx_inputs maps key -> human-friendly label for display)
+    for it_key, label in sorted(ctx_inputs.items()):
         merged["input_text"].setdefault(it_key, {
-            "name": f"HASSL Ctx {it_key}",
+            "name": f"HASSL Ctx {label}",
             "max": 64
         })
 
-    # 5) Add schedule booleans (declared + per-rule + used-but-undeclared)
+    # 5) Add schedule booleans (declared + per-rule) — keep their nice display names
     for key, obj in schedule_helpers.items():
         merged["input_boolean"].setdefault(key, obj)
 
-    # 6) Write back with friendly header
+    # 6) Write back
     header = "# Generated by HASSL codegen\n"
     helpers_yaml = yaml.safe_dump(merged, sort_keys=False)
     helpers_path.write_text(header + helpers_yaml)

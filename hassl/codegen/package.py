@@ -16,6 +16,19 @@ PROP_CONFIG = {
         "upstream": {"attr": "color_temp"},
         "service": {"domain": "light", "service": "light.turn_on", "data_key": "color_temp"}
     },
+    "kelvin": {
+        # Typical usable range; adjust if your bulbs differ (e.g., 2000–6500K)
+        "proxy": {"type": "input_number", "min": 2000, "max": 6500, "step": 50},
+        # Newer HA exposes color_temp_kelvin; we prefer that for upstream reads
+        "upstream": {"attr": "color_temp_kelvin"},
+        # Downstream: HA light.turn_on supports 'kelvin' directly
+        "service": {"domain": "light", "service": "light.turn_on", "data_key": "kelvin"}
+    },
+    "hs_color": {
+        "proxy": {"type": "input_text"},
+        "upstream": {"attr": "hs_color"},
+        "service": {"domain": "light", "service": "light.turn_on", "data_key": "hs_color"}
+    },
     "percentage": {
         "proxy": {"type": "input_number", "min": 0, "max": 100, "step": 1},
         "upstream": {"attr": "percentage"},
@@ -81,7 +94,10 @@ def emit_package(ir: IRProgram, outdir: str):
     for e in sorted(sync_entities):
         helpers["input_text"][f"hassl_ctx_{_safe(e)}"] = {"name": f"HASSL Ctx {e}", "max": 64}
         for prop in sorted(entity_props[e]):
-            helpers["input_text"][f"hassl_ctx_{_safe(e)}_{prop}"] = {"name": f"HASSL Ctx {e} {prop}", "max": 64}
+            if prop != "onoff":
+                helpers["input_text"][f"hassl_ctx_{_safe(e)}_{prop}"] = {
+                    "name": f"HASSL Ctx {e} {prop}", "max": 64
+                }
 
     # Proxies
     for s in ir.syncs:
@@ -100,98 +116,220 @@ def emit_package(ir: IRProgram, outdir: str):
 
     # Writer scripts per (sync, member, prop)
     for s in ir.syncs:
-        for p in ir.syncs[0].properties if False else s.properties:  # keep loop explicit
+        # be defensive in case props/members are empty
+        if not getattr(s, "properties", None):
+            continue
+        if not getattr(s, "members", None):
+            continue
+
+        for p in s.properties:
+            prop = getattr(p, "name", None) or (p.get("name") if isinstance(p, dict) else None)
+            if not prop:
+                continue
+
             for m in s.members:
-                prop = p.name; dom = _domain(m)
+                dom = _domain(m)
                 script_key = f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_{prop}_set"
+
+                # Step 1: always stamp context to block feedback loops
                 seq = [{
                     "service": "input_text.set_value",
-                    "data": {"entity_id": _context_entity(m, prop if prop!="onoff" else None), "value": "{{ this.context.id }}"}
+                    "data": {
+                        "entity_id": _context_entity(m, prop if prop != "onoff" else None),
+                        "value": "{{ this.context.id }}"
+                    }
                 }]
-                if prop != "onoff":
+
+                # Step 2: for non-onoff, forward the value to the actual device
+                if prop == "hs_color":
+                    # value is a JSON string; HA expects a list
+                    seq.append({
+                        "service": "light.turn_on",
+                        "target": {"entity_id": m},
+                        "data": { "hs_color": "{{ value | from_json }}" }
+                    })
+                elif prop != "onoff":
                     svc = PROP_CONFIG.get(prop, {}).get("service", {})
                     service = svc.get("service", f"{dom}.turn_on")
                     data_key = svc.get("data_key", prop)
-                    seq.append({"service": service, "target": {"entity_id": m}, "data": { data_key: "{{ value }}" }})
-                scripts["script"][script_key] = {"alias": f"HASSL write (sync {s.name} → {m} {prop})", "mode": "single", "sequence": seq}
+                    seq.append({
+                        "service": service,
+                        "target": {"entity_id": m},
+                        "data": { data_key: "{{ value }}" }
+                    })
 
+                # actually register the script
+                scripts["script"][script_key] = {
+                    "alias": f"HASSL write (sync {s.name} → {m} {prop})",
+                    "mode": "single",
+                    "sequence": seq
+                }
+                        
     # Upstream automations
     for s in ir.syncs:
         for p in s.properties:
-            prop = p.name; triggers = []; conditions = []; actions = []
+            prop = p.name;
+            triggers = [];
+            conditions = [];
+            actions = []
+            
             if prop == "onoff":
-                for m in s.members: triggers.append({"platform": "state", "entity_id": m})
-                conditions.append({"condition": "template", "value_template": "{{ trigger.to_state.context.parent_id != states('%s') }}" % _context_entity("{{ trigger.entity_id }}")})
+                for m in s.members:
+                    triggers.append({"platform": "state", "entity_id": m})
+                    
+                conditions.append({"condition": "template",
+                                   "value_template": (
+                                       "{{ trigger.to_state.context.parent_id != "
+                                       "states('input_text.hassl_ctx_' ~ trigger.entity_id|replace('.','_')) }}"
+                                   )
+                                   })
                 actions = [{
                     "choose": [
                         {"conditions": [{"condition":"template","value_template":"{{ trigger.to_state.state == 'on' }}"}],
-                         "sequence": [{"service":"input_boolean.turn_on","target":{"entity_id":_proxy_entity(s.name,"onoff")}}]},
+                         "sequence": [{"service":"input_boolean.turn_on","target":{"entity_id":f"input_boolean.hassl_{_safe(s.name)}_onoff"}}]
+                         },
                         {"conditions": [{"condition":"template","value_template":"{{ trigger.to_state.state != 'on' }}"}],
-                         "sequence": [{"service":"input_boolean.turn_off","target":{"entity_id":_proxy_entity(s.name,"onoff")}}]}
+                         "sequence": [{"service":"input_boolean.turn_off","target": {"entity_id": f"input_boolean.hassl_{_safe(s.name)}_onoff"}}]
+                         }
                     ]
                 }]
             else:
-                cfg = PROP_CONFIG.get(prop, {}); attr = cfg.get("upstream", {}).get("attr", prop)
+                cfg = PROP_CONFIG.get(prop, {});
+                attr = cfg.get("upstream", {}).get("attr", prop)
+
+                #state trigger on attribute
                 for m in s.members:
-                    triggers.append({"platform": "state", "value_template": "{{ state_attr('%s','%s') }}" % (m, attr)})
-                conditions.append({"condition":"template","value_template":"{{ trigger.to_state.context.parent_id != states('%s') }}" % _context_entity("{{ trigger.entity_id }}", prop)})
-                proxy_e = _proxy_entity(s.name, prop)
-                if prop in ("mute",):
+                    triggers.append({"platform": "state", "entity_id": m, "attribute": attr})
+                suffix = f"_{prop}" if prop != "onoff" else ""    
+                conditions.append({
+                    "condition":"template",
+                    "value_template": (
+                        "{{ trigger.to_state.context.parent_id != "
+                        "states('input_text.hassl_ctx_' ~ trigger.entity_id|replace('.', '_') ~ '" + suffix + "')  }}"
+                        )
+                })
+                
+                proxy_e = (
+                    f"input_text.hassl_{_safe(s.name)}_{prop}"
+                    if PROP_CONFIG.get(prop,{}).get("proxy",{}).get("type") == "input_text"
+                    else f"input_number.hassl_{_safe(s.name)}_{prop}"
+                )
+
+                if prop == "mute":
                     actions = [{
-                        "choose":[
-                            {"conditions":[{"condition":"template","value_template":"{{ state_attr(trigger.entity_id, '%s') | bool }}" % attr}],
-                             "sequence":[{"service":"input_boolean.turn_on","target":{"entity_id": proxy_e}}]},
-                            {"conditions":[{"condition":"template","value_template":"{{ not (state_attr(trigger.entity_id, '%s') | bool) }}" % attr}],
-                             "sequence":[{"service":"input_boolean.turn_off","target":{"entity_id": proxy_e}}]}
-                        ]}]
-                elif prop in ("preset_mode",):
-                    actions = [{"service":"input_text.set_value","data":{"entity_id": proxy_e,"value":"{{ state_attr(trigger.entity_id, '%s') }}" % attr}}]
+                        "choose": [
+                            {
+                                "conditions": [{"condition":"template","value_template": f"{{{{ state_attr(trigger.entity_id, '{attr}') | bool }}}}"}],
+                                "sequence": [{"service": "input_boolean.turn_on", "target": {"entity_id": proxy_e}}]
+                            },
+                            {
+                                "conditions": [{"condition":"template","value_template": f"{{{{ not (state_attr(trigger.entity_id, '{attr}') | bool) }}}}"}],
+                                "sequence": [{"service": "input_boolean.turn_off", "target": {"entity_id": proxy_e}}]
+                            }
+                        ]
+                    }]
+                elif prop == "preset_mode":
+                    actions = [{"service": "input_text.set_value", "data": {"entity_id": proxy_e, "value": f"{{{{ state_attr(trigger.entity_id, '{attr}') }}}}"}}]
+                elif prop == "hs_color":
+                    # Store JSON so we can send a real list back later
+                    actions = [{"service": "input_text.set_value", "data": {"entity_id": proxy_e, "value": f"{{{{ state_attr(trigger.entity_id, '{attr}') | to_json }}}}"}}]
                 else:
-                    actions = [{"service":"input_number.set_value","data":{"entity_id": proxy_e,"value":"{{ state_attr(trigger.entity_id, '%s') }}" % attr}}]
+                    actions = [{"service": "input_number.set_value", "data": {"entity_id": proxy_e, "value": f"{{{{ state_attr(trigger.entity_id, '{attr}') }}}}"}}]
+                    
             if triggers:
-                automations.append({"alias": f"HASSL sync {s.name} upstream {prop}", "mode": "restart", "trigger": triggers, "condition": conditions, "action": actions})
+                automations.append({
+                    "alias": f"HASSL sync {s.name} upstream {prop}",
+                    "mode": "restart",
+                    "trigger": triggers,
+                    "condition": conditions,
+                    "action": actions
+                })
 
     # Downstream automations
+        # Downstream automations
     for s in ir.syncs:
         for p in s.properties:
             prop = p.name
             if prop == "onoff":
-                trigger = [{"platform":"state","entity_id": _proxy_entity(s.name,"onoff")}]; actions = []
+                trigger = [{"platform":"state","entity_id": f"input_boolean.hassl_{_safe(s.name)}_onoff"}]
+                actions = []
                 for m in s.members:
-                    dom = _domain(m); cond_tpl = "{{ is_state('%s','on') != is_state('%s','on') }}" % (_proxy_entity(s.name,"onoff"), m)
-                    service_on  = _turn_service(dom, True); service_off = _turn_service(dom, False)
-                    actions.append({"choose":[
-                        {"conditions":[{"condition":"template","value_template":cond_tpl},{"condition":"state","entity_id": _proxy_entity(s.name,"onoff"),"state":"on"}],
-                         "sequence":[{"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_onoff_set"},{"service": service_on, "target":{"entity_id": m}}]},
-                        {"conditions":[{"condition":"template","value_template":cond_tpl},{"condition":"state","entity_id": _proxy_entity(s.name,"onoff"),"state":"off"}],
-                         "sequence":[{"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_onoff_set"},{"service": service_off, "target":{"entity_id": m}}]}
-                    ]})
+                    dom = _domain(m)
+                    cond_tpl = "{{ is_state('%s','on') != is_state('%s','on') }}" % (f"input_boolean.hassl_{_safe(s.name)}_onoff", m)
+                    service_on  = _turn_service(dom, True)
+                    service_off = _turn_service(dom, False)
+                    actions.append({
+                        "choose":[
+                            {
+                                "conditions":[
+                                    {"condition":"template","value_template":cond_tpl},
+                                    {"condition":"state","entity_id": f"input_boolean.hassl_{_safe(s.name)}_onoff","state":"on"}
+                                ],
+                                "sequence":[
+                                    {"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_onoff_set"},
+                                    {"service": service_on, "target":{"entity_id": m}}
+                                ]
+                            },
+                            {
+                                "conditions":[
+                                    {"condition":"template","value_template":cond_tpl},
+                                    {"condition":"state","entity_id": f"input_boolean.hassl_{_safe(s.name)}_onoff","state":"off"}
+                                ],
+                                "sequence":[
+                                    {"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_onoff_set"},
+                                    {"service": service_off, "target":{"entity_id": m}}
+                                ]
+                            }
+                        ]
+                    })
                 automations.append({"alias": f"HASSL sync {s.name} downstream onoff","mode":"queued","max":10,"trigger": trigger,"action": actions})
             else:
-                proxy_e = _proxy_entity(s.name, prop); trigger = [{"platform": "state","entity_id": proxy_e}]; actions = []
-                cfg = PROP_CONFIG.get(prop, {}); attr = cfg.get("upstream", {}).get("attr", prop)
+                proxy_e = (
+                    f"input_text.hassl_{_safe(s.name)}_{prop}"
+                    if PROP_CONFIG.get(prop,{}).get("proxy",{}).get("type") == "input_text"
+                    else f"input_number.hassl_{_safe(s.name)}_{prop}"
+                )
+                trigger = [{"platform": "state","entity_id": proxy_e}]
+                actions = []
+                cfg = PROP_CONFIG.get(prop, {})
+                attr = cfg.get("upstream", {}).get("attr", prop)
+
                 for m in s.members:
-                    if prop in ("mute",):
+                    if prop == "mute":
                         diff_tpl = "{{ (states('%s') == 'on') != (state_attr('%s','%s') | bool) }}" % (proxy_e, m, attr)
                         val_expr = "{{ iif(states('%s') == 'on', true, false) }}" % (proxy_e)
-                    elif prop in ("preset_mode",):
+                    elif prop == "preset_mode":
                         diff_tpl = "{{ (states('%s') != state_attr('%s','%s') ) }}" % (proxy_e, m, attr)
+                        val_expr = "{{ states('%s') }}" % (proxy_e)
+                    elif prop == "hs_color":
+                        # compare JSON string vs current attr rendered to JSON
+                        diff_tpl = "{{ states('%s') != (state_attr('%s','%s') | to_json) }}" % (proxy_e, m, attr)
+                        # pass JSON string to script; script converts with from_json
                         val_expr = "{{ states('%s') }}" % (proxy_e)
                     else:
                         diff_tpl = "{{ (states('%s') | float) != (state_attr('%s','%s') | float) }}" % (proxy_e, m, attr)
                         val_expr = "{{ states('%s') }}" % (proxy_e)
-                    actions.append({"choose":[{"conditions":[{"condition":"template","value_template": diff_tpl}], "sequence":[
-                        {"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_{prop}_set","data":{"value": val_expr}}
-                    ]}]})
+
+                    actions.append({
+                        "choose":[
+                            {
+                                "conditions":[{"condition":"template","value_template": diff_tpl}],
+                                "sequence":[
+                                    {"service":"script.%s" % f"hassl_write_sync_{_safe(s.name)}_{_safe(m)}_{prop}_set","data":{"value": val_expr}}
+                                ]
+                            }
+                        ]
+                    })
                 automations.append({"alias": f"HASSL sync {s.name} downstream {prop}","mode":"queued","max":10,"trigger": trigger,"action": actions})
 
     pkg = _pkg_slug(outdir)
+    
     # Write helpers.yaml / scripts.yaml
-    _dump_yaml(os.path.join(outdir, f"helpers__{pkg}.yaml"), helpers, ensure_sections=True)
+    _dump_yaml(os.path.join(outdir, f"helpers_{pkg}.yaml"), helpers, ensure_sections=True)
     _dump_yaml(os.path.join(outdir, f"scripts_{pkg}.yaml"), scripts)
 
     # Write automations per sync
     for s in ir.syncs:
         doc = [a for a in automations if a["alias"].startswith(f"HASSL sync {s.name}")]
         if doc:
-            _dump_yaml(os.path.join(outdir, f"sync__{pkg}__{_safe(s.name)}.yaml"), {"automation": doc})
+            _dump_yaml(os.path.join(outdir, f"sync_{pkg}_{_safe(s.name)}.yaml"), {"automation": doc})

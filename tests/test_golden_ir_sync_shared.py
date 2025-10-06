@@ -9,7 +9,7 @@ def test_golden_ir_sync_shared(tmp_path: Path):
     sync shared [a, b] as ksync
     '''
     outdir = tmp_path / "out"; ir = run_compile(src, outdir)
-    helpers = (outdir / "helpers__out.yaml").read_text()
+    helpers = (outdir / "helpers_out.yaml").read_text()
     data = yaml.safe_load(helpers)
 
     # Check the helper proxy exists and is properly named
