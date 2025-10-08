@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hassl"
-version = "0.2.0"
+version = "0.2.1"
 description = "HASSL: Home Assistant Simple Scripting Language"
 authors = [{ name="adanowitz" }]
 readme = "README.md"
@@ -17,7 +17,12 @@ hasslc = "hassl.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "."}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hassl*"]
+
+[tool.setuptools.package-data]
+# include all .lark files anywhere under hassl
+"hassl" = ["**/*.lark"]

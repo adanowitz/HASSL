@@ -1,6 +1,8 @@
 LICENSE
+MANIFEST.in
 README.md
 pyproject.toml
+setup.cfg
 ./hassl/__init__.py
 ./hassl/cli.py
 ./hassl/ast/__init__.py
@@ -10,6 +12,8 @@ pyproject.toml
 ./hassl/codegen/rules_min.py
 ./hassl/codegen/yaml_emit.py
 ./hassl/parser/__init__.py
+./hassl/parser/hassl.lark
+./hassl/parser/loader.py
 ./hassl/parser/transform.py
 ./hassl/semantics/__init__.py
 ./hassl/semantics/analyzer.py
@@ -29,6 +33,8 @@ hassl/codegen/package.py
 hassl/codegen/rules_min.py
 hassl/codegen/yaml_emit.py
 hassl/parser/__init__.py
+hassl/parser/hassl.lark
+hassl/parser/loader.py
 hassl/parser/transform.py
 hassl/semantics/__init__.py
 hassl/semantics/analyzer.py

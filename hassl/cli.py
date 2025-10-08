@@ -1,5 +1,6 @@
 import argparse
 import os, json
+from .parser.loader import load_grammar_text
 from .parser.transform import HasslTransformer
 from .ast.nodes import Program
 from lark import Lark
@@ -7,11 +8,10 @@ from .semantics.analyzer import analyze
 from .codegen.package import emit_package
 from .codegen import generate as codegen_generate
 
-GRAMMAR_PATH = os.path.join(os.path.dirname(__file__), "parser", "hassl.lark")
+#GRAMMAR_PATH = os.path.join(os.path.dirname(__file__), "parser", "hassl.lark")
 
 def parse_hassl(text: str) -> Program:
-    with open(GRAMMAR_PATH) as f:
-        grammar = f.read()
+    grammar = load_grammar_text()
     parser = Lark(grammar, start="start", parser="lalr", maybe_placeholders=False)
     tree = parser.parse(text)
     program = HasslTransformer().transform(tree)
