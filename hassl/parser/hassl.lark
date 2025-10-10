@@ -1,15 +1,18 @@
 // HASSL grammar — unified if_clause w/ optional inside/outside qualifier
 // + additive schedule support
+// + packages/imports + private visibility
 
 start: stmt*
 
-stmt: alias
+stmt: package_decl
+    | import_stmt
+    | alias
     | sync
     | rule
-    | schedule_decl           // NEW (additive)
+    | schedule_decl           
 
 // --- Aliases ---
-alias: "alias" CNAME "=" entity
+alias: PRIVATE? "alias" CNAME "=" entity //can mark private
 
 // --- Sync ---
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
@@ -84,7 +87,6 @@ UNIT: "ms" | "s" | "m" | "h" | "d"
 // Timepoint placeholder (kept simple)
 timepoint: CNAME
 
-// ---------- Schedules (additive) ----------
 SCHEDULE: "schedule"
 USE: "use"
 FROM: "from"
@@ -94,12 +96,13 @@ ENABLE: "enable"
 DISABLE: "disable"
 SUNRISE: "sunrise"
 SUNSET: "sunset"
+PRIVATE: "private"
 
 TIME_HHMM: /[0-2]?\d:[0-5]\d/
 OFFSET: /[+-]\d+(ms|s|m|h|d)/
 
 // Reusable named schedule declarations
-schedule_decl: SCHEDULE CNAME ":" schedule_clause+
+schedule_decl: PRIVATE? SCHEDULE CNAME ":" schedule_clause+
 
 // Clauses usable both in declarations and inline
 schedule_clause: schedule_op FROM time_spec schedule_end? ";"
@@ -109,7 +112,9 @@ schedule_end: TO time_spec    -> schedule_to
 
 // Rule-level usage
 rule_schedule_use: SCHEDULE USE name_list ";"
-name_list: CNAME ("," CNAME)*
+// allow qualified (pkg.symbol) via existing 'entity' rule
+name_list: name ("," name)*
+name: CNAME | entity
 
 // Inline schedule block inside a rule
 rule_schedule_inline: SCHEDULE schedule_clause+
@@ -137,3 +142,17 @@ entity: CNAME ("." CNAME)+
 LINE_COMMENT: /\/\/[^\n]*/
 %ignore LINE_COMMENT
 %ignore WS
+
+// ---- Packages & Imports ----
+package_decl: "package" entity
+
+//import forms:
+//       import home.shared.*
+//       import home.shared: wake_hours, light as landing_light
+//       import home.shared as shared
+import_stmt: "import" entity import_tail
+import_tail: ".*"
+       	   | ":" import_list
+	   | "as" CNAME
+import_list: import_item ("," import_item)*
+import_item: CNAME ("as" CNAME)?
