@@ -9,6 +9,16 @@ def _safe_entity(e: str) -> str:
     # safe for helper entity ids (dots → underscores)
     return str(e).replace(".", "_")
 
+def _dedup_dicts(seq):
+    """Stable de-dup for lists of small dicts (e.g., triggers)."""
+    out, seen = [], set()
+    for d in seq:
+        key = tuple(sorted((k, str(v)) for k, v in d.items()))
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
 def _gate_entity(rule_name: str) -> str:
     # single underscores only (HA slug rules)
     slug = _slug(rule_name)
@@ -23,7 +33,9 @@ def _entity_ctx_key(entity_id: str) -> str:
     return f"hassl_ctx_{_safe_entity(entity_id)}"
 
 def _schedule_bool(name: str) -> str:
-    return f"input_boolean.hassl_schedule_{_slug(name)}"
+    # Use base token (after last dot) so imported schedules match the declaring package’s boolean name.
+    base = str(name).split(".")[-1]
+    return f"input_boolean.hassl_schedule_{_slug(base)}"
 
 def _rule_schedule_bool(rule_name: str) -> str:
     return f"input_boolean.hassl_schedule_rule_{_slug(rule_name)}"
@@ -417,10 +429,11 @@ def generate_rules(ir, outdir):
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
 
     # Gather all schedule names used by rules (to ensure helpers even if undeclared)
+    # Normalize to base token so they match the booleans emitted by the declaring package.
     used_names = set()
     for r in ir.get("rules", []):
         for nm in (use_by_rule.get(r.get("name"), []) or []):
-            used_names.add(nm)
+            used_names.add(str(nm).split(".")[-1])
 
     # Ensure helpers for declared schedule booleans (default off)
     schedule_helpers = {
@@ -450,6 +463,7 @@ def generate_rules(ir, outdir):
 
         # 1) named schedules used by this rule
         for nm in use_by_rule.get(rname, []) or []:
+            base = str(nm).split(".")[-1]
             cond_schedule_entities.append(_schedule_bool(nm))
 
         # 2) inline schedule clauses → compile into a per-rule schedule boolean
@@ -478,6 +492,7 @@ def generate_rules(ir, outdir):
             actions = clause["actions"]
             entities = sorted(_entity_ids_in_expr(expr))
             triggers = [{"platform": "state", "entity_id": e} for e in entities] or [{"platform": "time", "at": "00:00:00"}]
+            triggers = _dedup_dicts(triggers)
             cond_ha = _condition_to_ha(clause["condition"])
             gate_cond = {"condition": "state", "entity_id": gate, "state": "on"}
 
@@ -586,8 +601,22 @@ def generate_rules(ir, outdir):
                         act_list.append({"service": "input_boolean.turn_on", "target": {"entity_id": gate_target}})
                     else:
                         act_list.append({"service": "logbook.log", "data": {"name": "HASSL", "message": f"{act['op']} rule {target_rule}"}})
+                elif act["type"] == "tag":
+                # Store tag value in an input_text so other automations/templates can read it
+                    key = f"hassl_tag_{_slug(act['name'])}"
+                    full = f"input_text.{key}"
+                    ctx_inputs.setdefault(key, act["name"])
+                    val = act["value"]
+                    act_list.append({
+                        "service": "input_text.set_value",
+                        "data": {"entity_id": full, "value": str(val)}
+                    })
                 else:
-                    act_list.append({"delay": "00:00:01"})
+                    # Try light.turn_on data first; fallback to generic service data
+                    if eid.startswith("light."):
+                        act_list.append({"service": "light.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
+                    else:
+                        act_list.append({"service": "homeassistant.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
 
             conds = [gate_cond] + sched_conds + [cond_ha]
             if qual_cond:

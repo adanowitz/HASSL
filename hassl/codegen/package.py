@@ -246,8 +246,8 @@ def emit_package(ir: IRProgram, outdir: str):
                 })
 
     # Downstream automations
-        # Downstream automations
     for s in ir.syncs:
+        invert_set = set(getattr(s, "invert", []) or [])
         for p in s.properties:
             prop = p.name
             if prop == "onoff":
@@ -256,8 +256,10 @@ def emit_package(ir: IRProgram, outdir: str):
                 for m in s.members:
                     dom = _domain(m)
                     cond_tpl = "{{ is_state('%s','on') != is_state('%s','on') }}" % (f"input_boolean.hassl_{_safe(s.name)}_onoff", m)
-                    service_on  = _turn_service(dom, True)
-                    service_off = _turn_service(dom, False)
+                    # flip target services if this member is inverted
+                    inv = (m in invert_set)
+                    service_on  = _turn_service(dom, not inv)  # proxy ON -> turn_on unless inverted
+                    service_off = _turn_service(dom, inv)      # proxy OFF -> turn_off unless inverted
                     actions.append({
                         "choose":[
                             {

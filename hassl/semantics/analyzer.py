@@ -132,6 +132,17 @@ def analyze(prog: Program) -> IRProgram:
             return local_public.get(key)
         return None
 
+        # Warn or raise if imported modules aren't in GLOBAL_EXPORTS
+    def _check_import_exists(mod: str):
+        """Emit a warning if module not found in GLOBAL_EXPORTS (user likely compiled only a subdir)."""
+        if 'GLOBAL_EXPORTS' not in globals():
+            return  # single-file compile, skip
+        exists = any(pkg == mod for (pkg, _kind, _name) in globals()['GLOBAL_EXPORTS'])
+        if not exists:
+            import sys
+            print(f"[hasslc] WARNING: imported module '{mod}' not found in build inputs "
+                  f"(run hasslc from a directory that includes it)", file=sys.stderr)
+        
     # Dig through Program.imports if present (transformer supplies a normalized list)
     for imp in getattr(prog, "imports", []) or []:
         if not isinstance(imp, dict) or imp.get("type") != "import":
@@ -139,6 +150,7 @@ def analyze(prog: Program) -> IRProgram:
             continue
         mod = imp.get("module", "")
         kind = imp.get("kind")
+        _check_import_exists(mod)
         if kind == "glob":
             # bring in all public aliases & schedules from 'mod'
             source = globals().get('GLOBAL_EXPORTS', local_public)

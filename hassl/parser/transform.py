@@ -80,20 +80,34 @@ class HasslTransformer(Transformer):
     # Package / Import
     # ================
     # package_decl: "package" entity
-    def package_decl(self, _pkg_kw, dotted):
+    # Depending on Lark optimization, the literal "package" may or may not be passed.
+    def package_decl(self, *children):
+        # children is either: (entity,)  or  ("package", entity)
+        if not children:
+            raise ValueError("package_decl: missing children")
+        if len(children) == 1:
+            dotted = children[0]
+        else:
+            dotted = children[-1]
         self.package = str(dotted)
-        # Optionally keep a sentinel in stmts for older analyzers:
+        # Optional sentinel for older analyzers:
         self.stmts.append({"type": "package", "name": self.package})
         return self.package
 
     # import_stmt: "import" entity import_tail
-    # import_tail: ".*" | ":" import_list | "as" CNAME
-    def import_stmt(self, _imp_kw, module, tail):
+    # Some parsers might pass only (entity, import_tail); others include the "import" literal.
+    def import_stmt(self, *children):
+        if len(children) == 2:
+            module, tail = children
+        elif len(children) == 3:
+            _, module, tail = children
+        else:
+            raise ValueError(f"import_stmt: unexpected children {children!r}")
         mod = str(module)
         kind, items, as_name = tail
         imp = {"type": "import", "module": mod, "kind": kind, "items": items, "as": as_name}
         self.imports.append(imp)
-        # Also drop a sentinel in stmts for backward-compat if desired:
+        # Optional sentinel in stmts for backward-compat:
         self.stmts.append({"type": "import", **imp})
         return imp
 
@@ -107,12 +121,10 @@ class HasslTransformer(Transformer):
             return ("glob", [], None)
         if len(args) == 2 and isinstance(args[0], Token) and str(args[0]) == ":":
             return ("list", args[1], None)
-        if len(args) == 2 and isinstance(args[0], Token) and args[0].type == "AS":
-            # Some Lark configs may not emit AS; grammar uses literal "as". Handle generically:
-            pass
-        if len(args) == 2 and isinstance(args[0], str) and args[0] == "as":
-            return ("alias", [], str(args[1]))
-        if len(args) == 2 and isinstance(args[0], Token) and str(args[0]) == "as":
+
+        # Handle 'as' in multiple representations (literal or tokenized)
+        if len(args) == 2 and ((isinstance(args[0], str) and args[0] == "as")
+                               or (isinstance(args[0], Token) and str(args[0]) == "as")):
             return ("alias", [], str(args[1]))
         # Fallback — treat as glob
         return ("glob", [], None)
@@ -293,7 +305,9 @@ class HasslTransformer(Transformer):
     
     # rule_schedule_use: SCHEDULE USE name_list ";"
     def rule_schedule_use(self, _sched_kw, _use_kw, names, _semi=None):
-        return {"type": "schedule_use", "names": [str(n) for n in names]}
+        # names is already a list from name_list(); ensure they’re strings
+        norm = [n if isinstance(n, str) else str(n) for n in names]
+        return {"type": "schedule_use", "names": norm}
 
     # rule_schedule_inline: SCHEDULE schedule_clause+
     def rule_schedule_inline(self, _sched_kw, *clauses):
@@ -319,9 +333,14 @@ class HasslTransformer(Transformer):
     def schedule_until(self, _until_kw, ts):
         return {"until": ts}
 
-    # name_list: CNAME ("," CNAME)*
+    # name_list: name ("," name)*
     def name_list(self, *names):
-        return [str(n) for n in names]
+        return [n if isinstance(n, str) else str(n) for n in names]
+
+    # name: CNAME | entity
+    def name(self, val):
+        # entity() already returns a dotted string; CNAME is Token → str
+        return str(val)
 
     # time_spec: TIME_HHMM -> time_clock
     def time_clock(self, tok):
@@ -332,6 +351,10 @@ class HasslTransformer(Transformer):
         event = str(event_tok).lower()
         off = str(offset_tok) if offset_tok is not None else "0s"
         return {"kind": "sun", "event": event, "offset": off}
+
+    def time_spec(self, *children):
+        # time_spec: TIME_HHMM | sun_spec | entity | CNAME
+        return children[0] if children else None
 
     # Unwrap rule_clause so clauses list contains IfClause nodes and/or dicts
     def rule_clause(self, item):
