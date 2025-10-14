@@ -1,0 +1,8 @@
+package home.landing
+import std.shared: wake_hours, landing_light
+// or: import std.shared as shared
+
+rule motion_light:
+  schedule use wake_hours;
+  if (motion && lux < 50) then landing_light = on;
+  wait (!motion for 10m) landing_light = off

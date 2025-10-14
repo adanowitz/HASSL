@@ -1,0 +1,7 @@
+package std.shared
+
+alias landing_light = light.landing_main
+private alias _debug = light.dev_fixture
+
+schedule wake_hours:
+  enable from 07:00 to 23:00;

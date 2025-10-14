@@ -1,0 +1,79 @@
+{
+  "aliases": {
+    "light": "light.living",
+    "motion": "binary_sensor.hall_motion",
+    "lux": "sensor.living_luminance"
+  },
+  "syncs": [
+    {
+      "name": "living_sync",
+      "kind": "shared",
+      "members": [
+        "light.living",
+        "switch.living_circuit"
+      ],
+      "invert": [],
+      "properties": [
+        "onoff"
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "name": "motion_on_light",
+      "clauses": [
+        {
+          "condition": {
+            "expr": {
+              "op": "and",
+              "left": {
+                "op": "and",
+                "left": {
+                  "op": "==",
+                  "left": "light.living",
+                  "right": "off"
+                },
+                "right": "binary_sensor.hall_motion"
+              },
+              "right": {
+                "op": "<",
+                "left": "sensor.living_luminance",
+                "right": 50
+              }
+            }
+          },
+          "actions": [
+            {
+              "type": "assign",
+              "target": "light.living",
+              "state": "on",
+              "for": "10m"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "set_brightness",
+      "clauses": [
+        {
+          "condition": {
+            "expr": {
+              "op": "==",
+              "left": "light.living",
+              "right": "on"
+            }
+          },
+          "actions": [
+            {
+              "type": "attr_assign",
+              "entity": "light.living",
+              "attr": "brightness",
+              "value": 180
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

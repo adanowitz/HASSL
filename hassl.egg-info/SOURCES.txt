@@ -8,6 +8,8 @@ setup.cfg
 ./hassl/ast/__init__.py
 ./hassl/ast/nodes.py
 ./hassl/codegen/__init__.py
+./hassl/codegen/generate.py
+./hassl/codegen/init.py
 ./hassl/codegen/package.py
 ./hassl/codegen/rules_min.py
 ./hassl/codegen/yaml_emit.py
@@ -29,6 +31,8 @@ hassl.egg-info/top_level.txt
 hassl/ast/__init__.py
 hassl/ast/nodes.py
 hassl/codegen/__init__.py
+hassl/codegen/generate.py
+hassl/codegen/init.py
 hassl/codegen/package.py
 hassl/codegen/rules_min.py
 hassl/codegen/yaml_emit.py
@@ -41,3 +45,4 @@ hassl/semantics/analyzer.py
 hassl/semantics/domains.py
 tests/test_codegen_sync_basic.py
 tests/test_golden_ir_sync_shared.py
+tests/test_imports_and_schedules.py

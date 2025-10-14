@@ -416,9 +416,8 @@ def _collect_schedules(ir: dict):
 
 # ----------------- main generate -----------------
 def generate_rules(ir, outdir):
-    rules = ir.get("rules", [])
-    if not rules:
-        return
+    # Always build outputs, even if there are no rules (schedules may still exist)
+    rules = ir.get("rules", []) or []
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
     bundled = []
