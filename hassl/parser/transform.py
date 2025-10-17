@@ -1,4 +1,4 @@
-from lark import Transformer, v_args, Token
+from lark import Transformer, v_args, Token, Tree
 from ..ast import nodes
 
 def _atom(val):
@@ -31,32 +31,23 @@ class HasslTransformer(Transformer):
         
     # --- Program / Aliases / Syncs ---
     def start(self, *stmts):
-        # We’ve been accumulating into self.stmts to preserve order.
-        # Prefer newer Program signature if available; fallback otherwise.
         try:
             return nodes.Program(statements=self.stmts, package=self.package,
                                  imports=self.imports)
         except TypeError:
-            # Keep backward-compat by returning statements-only Program.
-            # (Analyzer can optionally find package/imports via sentinel
-            # dicts in self.stmts if you choose to append them.)
             return nodes.Program(statements=self.stmts)
 
     # alias: PRIVATE? "alias" CNAME "=" entity
     def alias(self, *args):
-        # Handles both legacy (name, entity) and new (PRIVATE?, name,
-        #entity) shapes.
         private = False
         if len(args) == 2:
             name, entity = args
         else:
-            # (priv, name, entity)
             priv_tok, name, entity = args
             private = True if isinstance(priv_tok, Token) and priv_tok.type == "PRIVATE" else bool(priv_tok)
         try:
             a = nodes.Alias(name=str(name), entity=str(entity), private=private)
         except TypeError:
-            # nodes.Alias may not yet accept 'private'; store on a dict for analyzer to read.
             a = nodes.Alias(name=str(name), entity=str(entity))
             setattr(a, "private", private)
         self.stmts.append(a)
@@ -80,54 +71,94 @@ class HasslTransformer(Transformer):
     # Package / Import
     # ================
     # package_decl: "package" entity
-    # Depending on Lark optimization, the literal "package" may or may not be passed.
     def package_decl(self, *children):
-        # children is either: (entity,)  or  ("package", entity)
         if not children:
             raise ValueError("package_decl: missing children")
-        if len(children) == 1:
-            dotted = children[0]
-        else:
-            dotted = children[-1]
+        dotted = children[-1]  # handle optional literal "package"
         self.package = str(dotted)
-        # Optional sentinel for older analyzers:
         self.stmts.append({"type": "package", "name": self.package})
         return self.package
 
-    # import_stmt: "import" entity import_tail
-    # Some parsers might pass only (entity, import_tail); others include the "import" literal.
+    # ---- NEW: module_ref to support bare or dotted imports ----
+    # module_ref: CNAME ("." CNAME)*
+    def module_ref(self, *parts):
+        return ".".join(str(p) for p in parts)
+
+    # import_stmt: "import" module_ref import_tail?
     def import_stmt(self, *children):
-        if len(children) == 2:
+        """
+        Accepts:
+          [module_ref]                       -> bare:  import aliases
+          [module_ref, import_tail]          -> import home.shared: x, y
+          ["import", module_ref, ...]        -> if the literal sneaks in
+        Normalizes to:
+          {"type":"import","module":<str>,"kind":<glob|list|alias|none>,
+           "items":[...], "as":<str|None>}
+        """
+        if not children:
+            return None
+
+        # If the literal "import" is present, drop it.
+        if isinstance(children[0], Token) and str(children[0]) == "import":
+            children = children[1:]
+
+        if len(children) == 1:
+            module = children[0]
+            tail = None
+        elif len(children) == 2:
             module, tail = children
-        elif len(children) == 3:
-            _, module, tail = children
         else:
             raise ValueError(f"import_stmt: unexpected children {children!r}")
-        mod = str(module)
-        kind, items, as_name = tail
-        imp = {"type": "import", "module": mod, "kind": kind, "items": items, "as": as_name}
+
+        # module_ref should already be a str (via module_ref()), but normalize just in case
+        if isinstance(module, Tree) and module.data == "module_ref":
+            module = ".".join(str(t.value) for t in module.children)
+        else:
+            module = str(module)
+
+        # Normalize tail
+        kind, items, as_name = ("none", [], None)
+        if tail is not None:
+            if isinstance(tail, tuple) and len(tail) == 3:
+                kind, items, as_name = tail
+            else:
+                # Defensive: try to parse tail-like shapes
+                norm = self.import_tail(tail)
+                if isinstance(norm, tuple) and len(norm) == 3:
+                    kind, items, as_name = norm
+
+        imp = {"type": "import", "module": module, "kind": kind, "items": items, "as": as_name}
         self.imports.append(imp)
-        # Optional sentinel in stmts for backward-compat:
         self.stmts.append({"type": "import", **imp})
         return imp
 
+    # import_tail: ".*" | ":" import_list | "as" CNAME
+    # normalize to a tuple: (kind, items, as_name)
     def import_tail(self, *args):
-        # normalized to (kind, items, as_name)
-        # Shapes from the parser:
-        #   ".*"                  -> ( "glob", [], None )
-        #   ":" import_list       -> ( "list", [items], None )
-        #   "as" CNAME            -> ( "alias", [], "name" )
-        if len(args) == 1 and isinstance(args[0], Token) and str(args[0]) == ".*":
-            return ("glob", [], None)
-        if len(args) == 2 and isinstance(args[0], Token) and str(args[0]) == ":":
-            return ("list", args[1], None)
+        # Forms we might see:
+        #   (Token('.*'),)                          -> glob
+        #   (Token('":"'), import_list_tree)        -> list
+        #   (Token('AS',"as"), Token('CNAME',...))  -> alias
+        if len(args) == 1 and isinstance(args[0], Token):
+            if str(args[0]) == ".*":
+                return ("glob", [], None)
 
-        # Handle 'as' in multiple representations (literal or tokenized)
-        if len(args) == 2 and ((isinstance(args[0], str) and args[0] == "as")
-                               or (isinstance(args[0], Token) and str(args[0]) == "as")):
-            return ("alias", [], str(args[1]))
-        # Fallback — treat as glob
-        return ("glob", [], None)
+        if len(args) == 2:
+            a0, a1 = args
+            # ":" import_list
+            if isinstance(a0, Token) and str(a0) == ":":
+                # a1 should already be a python list via import_list()
+                return ("list", a1 if isinstance(a1, list) else [a1], None)
+            # "as" CNAME  (either literal or tokenized)
+            if (isinstance(a0, Token) and str(a0) == "as") or (isinstance(a0, str) and a0 == "as"):
+                return ("alias", [], str(a1))
+
+        # Already normalized (kind, items, as_name)
+        if len(args) == 3 and isinstance(args[0], str):
+            return args  # trust caller
+
+        # Optional tail missing or unknown -> "none"
+        return ("none", [], None)
 
     def import_list(self, *items): return list(items)
 
@@ -135,12 +166,10 @@ class HasslTransformer(Transformer):
     def import_item(self, *parts):
         if len(parts) == 1:
             return {"name": str(parts[0]), "as": None}
-        # (name, "as", alias) or (name, Token('as'), alias)
         return {"name": str(parts[0]), "as": str(parts[-1])}
 
     # --- Rules / if_clause ---
     def rule(self, name, *clauses):
-        # clauses may include IfClause nodes AND schedule_* dicts (we keep both).
         r = nodes.Rule(name=str(name), clauses=list(clauses))
         self.stmts.append(r)
         return r
@@ -151,7 +180,6 @@ class HasslTransformer(Transformer):
         core = list(parts[:-1])
         expr = core[0]
         quals = [q for q in core[1:] if isinstance(q, dict) and "not_by" in q]
-
         cond = {"expr": expr}
         if quals:
             cond.update(quals[-1])  # prefer last qualifier
@@ -211,39 +239,24 @@ class HasslTransformer(Transformer):
     # Robust rule control
     def rulectrl(self, *parts):
         from lark import Token
-
-        def s(x):  # normalize tokens -> str/primitive
-            return str(x) if isinstance(x, Token) else x
-
+        def s(x): return str(x) if isinstance(x, Token) else x
         vals = [s(p) for p in parts]
 
-        # op
-        op = None
-        for v in vals:
-            if isinstance(v, str) and v.lower() in ("disable", "enable"):
-                op = v.lower()
-                break
-        if not op:
-            op = "disable"
+        op = next((v.lower() for v in vals if isinstance(v, str) and v.lower() in ("disable","enable")), "disable")
 
-        # name
         name = None
         keywords = {"rule", "for", "until", "disable", "enable"}
         if "rule" in [str(v).lower() for v in vals if isinstance(v, str)]:
-            rs = [i for i, v in enumerate(vals) if isinstance(v, str) and v.lower() == "rule"]
-            for i in rs:
-                if i + 1 < len(vals):
-                    name = vals[i + 1]
-                    break
+            for i, v in enumerate(vals):
+                if isinstance(v, str) and v.lower() == "rule" and i + 1 < len(vals):
+                    name = vals[i + 1]; break
         if name is None:
             for v in vals:
                 if isinstance(v, str) and v.lower() not in keywords:
-                    name = v
-                    break
+                    name = v; break
         if name is None:
             raise ValueError(f"rulectrl: could not determine rule name from parts={vals!r}")
 
-        # tail
         payload = {}
         try:
             start_idx = vals.index(name) + 1
@@ -252,24 +265,17 @@ class HasslTransformer(Transformer):
 
         i = start_idx
         while i < len(vals):
-            v = vals[i]
-            vlow = str(v).lower() if isinstance(v, str) else ""
+            v = vals[i]; vlow = str(v).lower() if isinstance(v, str) else ""
             if vlow == "for" and i + 1 < len(vals):
-                payload["for"] = vals[i + 1]
-                i += 2
-                continue
+                payload["for"] = vals[i + 1]; i += 2; continue
             if vlow == "until" and i + 1 < len(vals):
-                payload["until"] = vals[i + 1]
-                i += 2
-                continue
+                payload["until"] = vals[i + 1]; i += 2; continue
             i += 1
 
         if not payload:
-            units = ("ms", "s", "m", "h", "d")
             for v in vals[start_idx:]:
-                if isinstance(v, str) and any(v.endswith(u) for u in units):
-                    payload["for"] = v
-                    break
+                if isinstance(v, str) and any(v.endswith(u) for u in ("ms","s","m","h","d")):
+                    payload["for"] = v; break
 
         if not payload:
             payload["for"] = "0s"
@@ -289,13 +295,11 @@ class HasslTransformer(Transformer):
         private = False
         if idx < len(parts) and isinstance(parts[idx], Token) and parts[idx].type == "PRIVATE":
             private = True; idx += 1
-        # next must be SCHEDULE
         if idx < len(parts) and isinstance(parts[idx], Token) and parts[idx].type == "SCHEDULE":
             idx += 1
         if idx >= len(parts):
             raise ValueError("schedule_decl: missing schedule name")
         name = str(parts[idx]); idx += 1
-        # optional ":" token
         if idx < len(parts) and isinstance(parts[idx], Token) and str(parts[idx]) == ":":
             idx += 1
         clauses = [c for c in parts[idx:] if isinstance(c, dict) and c.get("type") == "schedule_clause"]
@@ -305,7 +309,6 @@ class HasslTransformer(Transformer):
     
     # rule_schedule_use: SCHEDULE USE name_list ";"
     def rule_schedule_use(self, _sched_kw, _use_kw, names, _semi=None):
-        # names is already a list from name_list(); ensure they’re strings
         norm = [n if isinstance(n, str) else str(n) for n in names]
         return {"type": "schedule_use", "names": norm}
 
@@ -318,44 +321,34 @@ class HasslTransformer(Transformer):
     def schedule_clause(self, op, _from_kw, start, end=None, _semi=None):
         d = {"type": "schedule_clause", "op": str(op), "from": start}
         if isinstance(end, dict):
-            d.update(end)  # {"to": ...} or {"until": ...}
+            d.update(end)
         return d
 
-    # schedule_op: ENABLE | DISABLE
     def schedule_op(self, tok):
         return str(tok).lower()
 
-    # schedule_end: TO time_spec -> schedule_to
     def schedule_to(self, _to_kw, ts):
         return {"to": ts}
 
-    # schedule_end: UNTIL time_spec -> schedule_until
     def schedule_until(self, _until_kw, ts):
         return {"until": ts}
 
-    # name_list: name ("," name)*
     def name_list(self, *names):
         return [n if isinstance(n, str) else str(n) for n in names]
 
-    # name: CNAME | entity
     def name(self, val):
-        # entity() already returns a dotted string; CNAME is Token → str
         return str(val)
 
-    # time_spec: TIME_HHMM -> time_clock
     def time_clock(self, tok):
         return {"kind": "clock", "value": str(tok)}
 
-    # sun_spec: (SUNRISE|SUNSET) OFFSET? -> time_sun
     def time_sun(self, event_tok, offset_tok=None):
         event = str(event_tok).lower()
         off = str(offset_tok) if offset_tok is not None else "0s"
         return {"kind": "sun", "event": event, "offset": off}
 
     def time_spec(self, *children):
-        # time_spec: TIME_HHMM | sun_spec | entity | CNAME
         return children[0] if children else None
 
-    # Unwrap rule_clause so clauses list contains IfClause nodes and/or dicts
     def rule_clause(self, item):
         return item

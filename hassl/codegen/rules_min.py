@@ -1,9 +1,10 @@
 import os, re, yaml
 from pathlib import Path
+from hassl.semantics import analyzer as sem_analyzer
 
 # ----------------- slug helpers -----------------
 def _slug(s: str) -> str:
-    return str(s).lower().replace(" ", "_")
+    return re.sub(r'[^a-z0-9]+', '_', str(s).lower()).strip('_')
 
 def _safe_entity(e: str) -> str:
     # safe for helper entity ids (dots → underscores)
@@ -32,13 +33,62 @@ def _entity_ctx_key(entity_id: str) -> str:
     # input_text key to hold the last context for a plain entity action
     return f"hassl_ctx_{_safe_entity(entity_id)}"
 
-def _schedule_bool(name: str) -> str:
-    # Use base token (after last dot) so imported schedules match the declaring package’s boolean name.
+def _schedule_sensor(name: str, pkg: str) -> str:
+    """
+    Match the entity_id that package.py's ScheduleRegistry emits:
+      binary_sensor.hassl_schedule_{pkg}_{name}_active
+    NOTE: 'name' here is the *base* schedule name (without package prefix).
+    """
     base = str(name).split(".")[-1]
-    return f"input_boolean.hassl_schedule_{_slug(base)}"
+    return f"binary_sensor.hassl_schedule_{_slug(pkg)}_{_slug(base)}_active"
 
-def _rule_schedule_bool(rule_name: str) -> str:
-    return f"input_boolean.hassl_schedule_rule_{_slug(rule_name)}"
+def _alias_map(ir: dict) -> dict:
+    """
+    Build alias -> entity_id mapping from the current IR and any imported exports.
+    """
+    amap = dict(ir.get("aliases", {}) or {})
+    # Pull in imported public aliases from GLOBAL_EXPORTS
+    for (pkg_name, kind, alias_name), obj in getattr(sem_analyzer, "GLOBAL_EXPORTS", {}).items():
+        if kind != "alias":
+            continue
+        target = getattr(obj, "entity", None)
+        if target is None and isinstance(obj, dict):
+            target = obj.get("entity")
+        if target:
+            amap[str(alias_name)] = str(target)
+    return amap
+
+def _resolve_name(name: str, aliases: dict) -> str:
+    """Return resolved entity_id if 'name' is an alias, else the original string."""
+    return aliases.get(str(name), str(name))
+
+def _resolve_expr_aliases(node, aliases: dict):
+    """
+    Walk the analyzer expr tree and replace bare alias tokens with entity_ids
+    so triggers/conditions are built against real entities.
+    """
+    if isinstance(node, dict) and "op" in node:
+        op = node["op"]
+        if op in ("and", "or"):
+            return {
+                "op": op,
+                "left": _resolve_expr_aliases(node["left"], aliases),
+                "right": _resolve_expr_aliases(node["right"], aliases),
+            }
+        if op == "not":
+            return {"op": "not", "value": _resolve_expr_aliases(node["value"], aliases)}
+        # binary compare
+        left = _resolve_expr_aliases(node.get("left"), aliases)
+        right = _resolve_expr_aliases(node.get("right"), aliases)
+        return {"op": op, "left": left, "right": right}
+    if isinstance(node, str):
+        # If it isn't already an entity_id (no dot) and matches an alias, swap it
+        if "." not in node and node in aliases:
+            return aliases[node]
+        return node
+    if isinstance(node, list):
+        return [_resolve_expr_aliases(x, aliases) for x in node]
+    return node
 
 def _pkg_slug(outdir: str) -> str:
     base = os.path.basename(os.path.abspath(outdir))
@@ -157,7 +207,7 @@ def _condition_to_ha(cond):
     return cv(expr)
 
 
-# ----------------- schedule helpers -----------------
+# ----------------- schedule → conditions -----------------
 def _parse_offset(off: str) -> str:
     """Convert +15m / -10s / +2h to +/-HH:MM:SS string for HA sun offset"""
     if not off: return "00:00:00"
@@ -170,64 +220,11 @@ def _parse_offset(off: str) -> str:
     s = seconds % 60
     return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
 
-def _time_trigger_from_spec(ts):
-    """Return a HA trigger (or list of triggers) from a time_spec dict or entity string."""
-    if isinstance(ts, dict):
-        kind = ts.get("kind")
-        if kind == "clock":
-            hhmm = ts.get("value", "00:00")
-            hh, mm = hhmm.split(":")
-            at = f"{int(hh):02d}:{int(mm):02d}:00"
-            return {"platform": "time", "at": at}
-        if kind == "sun":
-            event = ts.get("event", "sunrise")
-            off = _parse_offset(ts.get("offset", "0s"))
-            trig = {"platform": "sun", "event": event}
-            if off and off != "00:00:00":
-                trig["offset"] = off
-            return trig
-        # Fallback – treat dict with stringified entity
-        val = ts.get("value")
-        if isinstance(val, str) and "." in val:
-            return {"platform": "state", "entity_id": val, "to": "on"}
-    elif isinstance(ts, str) and "." in ts:
-        return {"platform": "state", "entity_id": ts, "to": "on"}
-    # default: 00:00
-    return {"platform": "time", "at": "00:00:00"}
-
-def _end_trigger_from_spec(ts):
-    """Like _time_trigger_from_spec but choose the natural 'end' event:
-       - clock/sun → same kind at end time
-       - entity → to: 'off' """
-    if isinstance(ts, dict):
-        kind = ts.get("kind")
-        if kind == "clock":
-            hhmm = ts.get("value", "00:00")
-            hh, mm = hhmm.split(":")
-            at = f"{int(hh):02d}:{int(mm):02d}:00"
-            return {"platform": "time", "at": at}
-        if kind == "sun":
-            event = ts.get("event", "sunset")
-            off = _parse_offset(ts.get("offset", "0s"))
-            trig = {"platform": "sun", "event": event}
-            if off and off != "00:00:00":
-                trig["offset"] = off
-            return trig
-        val = ts.get("value")
-        if isinstance(val, str) and "." in val:
-            return {"platform": "state", "entity_id": val, "to": "off"}
-    elif isinstance(ts, str) and "." in ts:
-        return {"platform": "state", "entity_id": ts, "to": "off"}
-    return {"platform": "time", "at": "00:00:00"}
-
 def _clock_between_cond(hhmm_start: str, hhmm_end: str):
     """
     Build a HA template condition that is true when current time (HH:MM) is within [start, end),
     correctly handling wrap-past-midnight (e.g., 22:00..06:00).
     """
-    # zero-padded strings compare lexicographically
-    # in_window = (S <= now < E) if S < E
-    #           = (now >= S) or (now < E) if S >= E  (wrap)
     return {
         "condition": "template",
         "value_template": (
@@ -269,15 +266,12 @@ def _window_condition_from_specs(start_ts, end_ts):
         # Otherwise AND(after start, before end)
         after_start = _sun_edge_cond("after", start_ts)
         before_end  = _sun_edge_cond("before", end_ts)
-        # Heuristic: sunset..sunrise wraps; sunrise..sunset doesn't.
         wrap = (start_ts.get("event") == "sunset" and end_ts.get("event") == "sunrise")
         if wrap:
             return {"condition": "or", "conditions": [after_start, before_end]}
         return {"condition": "and", "conditions": [after_start, before_end]}
 
     # Mixed (clock ↔ sun) → fall back to a template that compares minute-of-day
-    # We approximate sun edge minutes with next/prev sun events; evaluated each minute.
-    # This keeps things robust after restarts without complex math.
     return {
         "condition": "template",
         "value_template": (
@@ -308,78 +302,19 @@ def _window_condition_from_specs(start_ts, end_ts):
         }
     }
 
-
-def _emit_schedule_clause_automations(name: str, clause: dict, autos: list):
+def _schedule_clause_to_condition(clause: dict):
     """
-    For a schedule clause:
-      {"type":"schedule_clause","op":"enable|disable","from": <ts>, ["to": <ts>] | ["until": <ts>]}
-    we emit two one-shot automations (start/end) that set input_boolean.hassl_schedule_<name>
+    Convert a single inline schedule clause to a HA condition.
+    enable  from A to B  -> within window(A,B)
+    disable from A to B  -> NOT within window(A,B)
     """
-    bool_e = _schedule_bool(name)
-    op = clause.get("op", "enable").lower()
-
+    op = (clause.get("op") or "enable").lower()
     start_ts = clause.get("from")
     end_ts = clause.get("to", clause.get("until"))
-
-    start_trig = _time_trigger_from_spec(start_ts) if start_ts is not None else None
-    end_trig   = _end_trigger_from_spec(end_ts)   if end_ts   is not None else None
-
-    # At start: set according to op
-    if start_trig:
-        autos.append({
-            "alias": f"HASSL schedule {name} start",
-            "mode": "single",
-            "trigger": [start_trig],
-            "action": [{
-                "service": "input_boolean.turn_on" if op == "enable" else "input_boolean.turn_off",
-                "target": {"entity_id": bool_e}
-            }]
-        })
-    # At end: invert
-    if end_trig:
-        autos.append({
-            "alias": f"HASSL schedule {name} end",
-            "mode": "single",
-            "trigger": [end_trig],
-            "action": [{
-                "service": "input_boolean.turn_off" if op == "enable" else "input_boolean.turn_on",
-                "target": {"entity_id": bool_e}
-            }]
-        })
-
-    # --- Maintenance / initializer ---
-    # Ensure correct state after HA restart and when package is added mid-day.
-    # We evaluate every minute and on start.
-    if start_ts is not None and end_ts is not None:
-        in_window_cond = _window_condition_from_specs(start_ts, end_ts)
-        # If op == enable → ON inside window, OFF outside; if op == disable → inverted.
-        autos.append({
-            "alias": f"HASSL schedule {name} maintain",
-            "mode": "single",
-            "trigger": [
-                {"platform": "homeassistant", "event": "start"},
-                {"platform": "time_pattern", "minutes": "/1"}
-            ],
-            "condition": [],
-            "action": [{
-                "choose": [
-                    {
-                        "conditions": [in_window_cond],
-                        "sequence": [{
-                            "service": "input_boolean.turn_on" if op == "enable" else "input_boolean.turn_off",
-                            "target": {"entity_id": bool_e}
-                        }]
-                    },
-                    {
-                        "conditions": [{"condition": "not", "conditions": [in_window_cond]}],
-                        "sequence": [{
-                            "service": "input_boolean.turn_off" if op == "enable" else "input_boolean.turn_on",
-                            "target": {"entity_id": bool_e}
-                        }]
-                    }
-                ]
-            }]
-        })
+    base = _window_condition_from_specs(start_ts, end_ts) if (start_ts and end_ts) else {"condition":"template","value_template":"true"}
+    if op == "disable":
+        return {"condition": "not", "conditions": [base]}
+    return base
 
 def _collect_schedules(ir: dict):
     """
@@ -424,33 +359,45 @@ def generate_rules(ir, outdir):
     # collect helper keys we must ensure exist
     ctx_inputs = {}
 
+    # package slug for schedule sensor ids
+    pkg = _pkg_slug(outdir)
+
     # --- schedules collection ---
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
 
-    # Gather all schedule names used by rules (to ensure helpers even if undeclared)
-    # Normalize to base token so they match the booleans emitted by the declaring package.
-    used_names = set()
-    for r in ir.get("rules", []):
-        for nm in (use_by_rule.get(r.get("name"), []) or []):
-            used_names.add(str(nm).split(".")[-1])
+    # --- alias resolution map (local + imported public aliases) ---
+    aliases = _alias_map(ir)
 
-    # Ensure helpers for declared schedule booleans (default off)
-    schedule_helpers = {
-        _schedule_bool(nm).split(".",1)[1]: {
-            "name": f"HASSL Schedule {nm}", "initial": "off"
-        } for nm in declared_schedules.keys()
-    }
-    # Also ensure helpers for used-but-undeclared schedules (still default off)
-    for nm in sorted(used_names - set(declared_schedules.keys())):
-        schedule_helpers[_schedule_bool(nm).split(".",1)[1]] = {
-            "name": f"HASSL Schedule {nm}", "initial": "off"
-        }
+    if os.getenv("HASSL_DEBUG"):
+        print("HASSL aliases:", aliases)  # should include {'master_lights': 'light....', 'master_stands': 'light....'}
+        
+    # Build exported schedules map from GLOBAL_EXPORTS: base_name -> declaring_pkg
+    
+    exported_sched_pkgs = {}
+    for (pkg_name, kind, sched_name), obj in getattr(sem_analyzer, "GLOBAL_EXPORTS", {}).items():
+        if kind == "schedule":
+            exported_sched_pkgs[str(sched_name)] = str(pkg_name)
 
-    # Build schedule automations for declared schedules
-    for nm, clauses in declared_schedules.items():
-        for cl in clauses:
-            if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
-                _emit_schedule_clause_automations(nm, cl, bundled)
+    # --- validation: every 'schedule use <name>' must be declared locally OR exported by imports ---
+    declared_base_names = {str(nm).split(".")[-1] for nm in (declared_schedules.keys() if declared_schedules else [])}
+    for rule in ir.get("rules", []) or []:
+        rname = rule.get("name", "<unnamed>")
+        for nm in (use_by_rule.get(rname, []) or []):
+            base = str(nm).split(".")[-1]
+            if base not in declared_base_names and (base not in exported_sched_pkgs):
+                expected_sensor = _schedule_sensor(base, pkg)
+                raise ValueError(
+                    "HASSL: schedule reference not found. "
+                    f"Rule '{rname}' uses schedule '{nm}', but no schedule named '{base}' "
+                    f"was declared in this package '{pkg}'.\n\n"
+                    "Declare it with:\n"
+                    f"  schedule {base}:\n"
+                    "    enable from <start> to <end>;\n\n"
+                    "Or ensure the schedule is declared in the same package.\n"
+                    f"(If you expected a sensor, codegen looks for: {expected_sensor})"
+                )
+
+    # NOTE: No helper creation here — package.py owns schedule sensors.
 
     # ---- build automations (rules) ----
     for rule in rules:
@@ -460,25 +407,18 @@ def generate_rules(ir, outdir):
         # gather schedule conditions for this rule
         cond_schedule_entities = []
 
-        # 1) named schedules used by this rule
+        # 1) named schedules used by this rule → state('on') of the schedule sensor
         for nm in use_by_rule.get(rname, []) or []:
             base = str(nm).split(".")[-1]
-            cond_schedule_entities.append(_schedule_bool(nm))
+            decl_pkg = exported_sched_pkgs.get(base, pkg)
+            cond_schedule_entities.append(_schedule_sensor(base, decl_pkg))
 
-        # 2) inline schedule clauses → compile into a per-rule schedule boolean
+        # 2) inline schedule clauses → compile directly to HA conditions (no helpers)
         inline_clauses = inline_by_rule.get(rname, []) or []
-        if inline_clauses:
-            rule_sched_bool = _rule_schedule_bool(rname)
-            # ensure helper exists (default off)
-            schedule_helpers[rule_sched_bool.split(".",1)[1]] = {
-                "name": f"HASSL Schedule (rule) {rname}",
-                "initial": "off"
-            }
-            inline_name = f"rule_{_slug(rname)}"  # ensures _schedule_bool(inline_name) == rule_sched_bool
-            for cl in inline_clauses:
-                if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
-                    _emit_schedule_clause_automations(inline_name, cl, bundled)
-            cond_schedule_entities.append(rule_sched_bool)
+        inline_schedule_conditions = []
+        for cl in inline_clauses:
+            if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
+                inline_schedule_conditions.append(_schedule_clause_to_condition(cl))
 
         # de-dup schedule conditions
         cond_schedule_entities = sorted(set(cond_schedule_entities))
@@ -487,16 +427,23 @@ def generate_rules(ir, outdir):
         for idx, clause in enumerate(rule["clauses"]):
             # Each clause is {"condition": ..., "actions": [...]}
             cname = f"{_slug(rname)}__{idx+1}"
-            expr = clause["condition"].get("expr", {})
+            expr0 = clause["condition"].get("expr", {})
+            # resolve aliases inside the boolean expression
+            expr = _resolve_expr_aliases(expr0, aliases)
             actions = clause["actions"]
             entities = sorted(_entity_ids_in_expr(expr))
             triggers = [{"platform": "state", "entity_id": e} for e in entities] or [{"platform": "time", "at": "00:00:00"}]
             triggers = _dedup_dicts(triggers)
-            cond_ha = _condition_to_ha(clause["condition"])
+            # rebuild condition dict with resolved expr
+            cond_in = dict(clause["condition"])
+            cond_in["expr"] = expr
+            cond_ha = _condition_to_ha(cond_in)
             gate_cond = {"condition": "state", "entity_id": gate, "state": "on"}
 
-            # schedule gate conditions (all must be ON)
+            # schedule gate conditions (all must be satisfied)
             sched_conds = [{"condition":"state","entity_id": e,"state":"on"} for e in cond_schedule_entities]
+            if inline_schedule_conditions:
+                sched_conds.extend(inline_schedule_conditions)
 
             # --- NOT_BY guard (qualifier) ---
             qual = clause.get("condition", {}).get("not_by")
@@ -525,7 +472,7 @@ def generate_rules(ir, outdir):
             act_list = []
             for act in actions:
                 if act["type"] == "assign":
-                    eid = act["target"]
+                    eid = _resolve_name(act["target"], aliases)
                     service = "turn_on" if act["state"] == "on" else "turn_off"
 
                     # stamp parent context so NOT_BY can ignore our own writes
@@ -537,7 +484,7 @@ def generate_rules(ir, outdir):
                     })
                     act_list.append({"service": f"homeassistant.{service}", "target": {"entity_id": eid}})
                 elif act["type"] == "attr_assign":
-                    eid = act["entity"]; attr = act["attr"]; val = act["value"]
+                    eid = _resolve_name(act["entity"], aliases); attr = act["attr"]; val = act["value"]
                     # stamp parent context (attr-specific)
                     _k, _e, _label = _ctx_key_and_entity(eid, attr)
                     ctx_inputs[_k] = _label
@@ -559,8 +506,6 @@ def generate_rules(ir, outdir):
                                 }
                             })
                         else:
-                            # If someone ever passes a non-numeric here, still try to emit both
-                            # (mireds computed by HA/Jinja would require templating; keep it simple)
                             act_list.append({
                                 "service": "light.turn_on",
                                 "target": {"entity_id": eid},
@@ -572,11 +517,11 @@ def generate_rules(ir, outdir):
                         act_list.append({"service": "homeassistant.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
                 elif act["type"] == "wait":
                     cond_expr = act["condition"].get("expr", act["condition"])
-                    vt = _expr_to_template(cond_expr)
+                    vt = _expr_to_template(_resolve_expr_aliases(cond_expr, aliases))
                     act_list.append({"wait_for_trigger": [{"platform": "template", "value_template": vt, "for": _dur_to_hms(act["for"])}]})
                     inner = act["then"]
                     if inner["type"] == "assign":
-                        eid = inner["target"]
+                        eid = _resolve_name(inner["target"], aliases)
                         service = "turn_on" if inner["state"] == "on" else "turn_off"
                         # stamp parent context for the inner action
                         _k, _e, _label = _ctx_key_and_entity(eid, None)
@@ -601,7 +546,7 @@ def generate_rules(ir, outdir):
                     else:
                         act_list.append({"service": "logbook.log", "data": {"name": "HASSL", "message": f"{act['op']} rule {target_rule}"}})
                 elif act["type"] == "tag":
-                # Store tag value in an input_text so other automations/templates can read it
+                    # Store tag value in an input_text so other automations/templates can read it
                     key = f"hassl_tag_{_slug(act['name'])}"
                     full = f"input_text.{key}"
                     ctx_inputs.setdefault(key, act["name"])
@@ -667,9 +612,9 @@ def generate_rules(ir, outdir):
     for name in sorted(n for n in gate_names if isinstance(n, str) and n.strip()):
         key = f"hassl_gate_{_slug(name)}"
         merged["input_boolean"][key] = {
-        "name": f"HASSL Gate {name}",
-        "initial": "on",
-    }
+            "name": f"HASSL Gate {name}",
+            "initial": "on",
+        }
 
     # 4) Ensure input_text helpers referenced by NOT_BY guards *and* context stamps exist
     #    (ctx_inputs maps key -> human-friendly label for display)
@@ -679,9 +624,7 @@ def generate_rules(ir, outdir):
             "max": 64
         })
 
-    # 5) Add schedule booleans (declared + per-rule) — keep their nice display names
-    for key, obj in schedule_helpers.items():
-        merged["input_boolean"].setdefault(key, obj)
+    # 5) (removed) schedule helpers are emitted in package.py as template binary_sensors
 
     # 6) Write back
     header = "# Generated by HASSL codegen\n"

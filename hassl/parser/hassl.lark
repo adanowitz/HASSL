@@ -146,13 +146,15 @@ LINE_COMMENT: /\/\/[^\n]*/
 // ---- Packages & Imports ----
 package_decl: "package" entity
 
-//import forms:
-//       import home.shared.*
-//       import home.shared: wake_hours, light as landing_light
-//       import home.shared as shared
-import_stmt: "import" entity import_tail
+// import forms (now also supports single-segment like `import aliases`):
+//   import aliases
+//   import home.shared.*
+//   import home.shared: wake_hours, light as landing_light
+//   import home.shared as shared
+import_stmt: "import" module_ref import_tail?
+module_ref: CNAME ("." CNAME)*
 import_tail: ".*"
-       	   | ":" import_list
-	   | "as" CNAME
+           | ":" import_list
+           | "as" CNAME
 import_list: import_item ("," import_item)*
 import_item: CNAME ("as" CNAME)?
