@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hassl"
-version = "0.2.1"
+version = "0.3.0"
 description = "HASSL: Home Assistant Simple Scripting Language"
 authors = [{ name="adanowitz" }]
 readme = "README.md"
