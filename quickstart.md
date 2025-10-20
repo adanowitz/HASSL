@@ -75,6 +75,7 @@ This generates a complete package containing:
 | `scripts_living_room.yaml`       | Context-aware writer scripts                                      |
 | `sync_living_room_*.yaml`        | Device and proxy synchronization automations                      |
 | `rules_bundled_living_room.yaml` | Rule logic automations                                            |
+| `schedules_living_room.yaml`     | Template schedule sensors and time/sun gating (v0.3.0)            |
 
 All filenames include the package slug to avoid collisions between multiple HASSL integrations.
 
@@ -125,9 +126,9 @@ rule motion_on_light:
 
 HASSL automatically:
 
-- Creates `input_boolean.hassl_schedule_wake_hours`
-- Adds ON/OFF automations at 08:00/19:00
-- Maintains correct state after restarts
+- Creates a `binary_sensor.hassl_schedule_<package>_wake_hours_active`
+- Adds ON/OFF gating logic in compiled automations
+- Maintains correct state across restarts
 
 ---
 
@@ -151,17 +152,18 @@ rule warm_light_evening:
 
 - Each `.hassl` file compiles into an isolated package. You can have multiple HASSL modules safely coexisting.
 - Use `not_by rule("name")` to distinguish which rule triggered an event.
-- Add or reload packages without full HA restarts — HASSL’s schedule maintainers re-evaluate after startup.
+- Add or reload packages without full HA restarts — HASSL’s schedule sensors re-evaluate continuously.
+- Use `private alias` to keep entity shortcuts local to one package (new in v0.3.0).
+- Organize multi-room setups with `package` and `import` statements.
 
 ---
 
 ## 9. 🧠 Learn more
 
-See the full [HASSL Language Specification](./HASSL_Specification.md) for detailed grammar and semantics, including `kelvin` attributes, schedule maintenance logic, and cross-device sync behavior.
+See the [HASSL Language Specification](./hassl_language_spec_v1.4_2025_updated_v0.3.0.md) for detailed grammar and semantics, including package imports, private exports, and schedule sensor logic.
 
 ---
 
 ### Happy automating with HASSL!
 
 Effortless logic, clean YAML, and predictable automation — all from one simple script.
-

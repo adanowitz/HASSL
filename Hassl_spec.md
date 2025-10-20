@@ -1,19 +1,62 @@
 # HASSL Language Specification (v1.4 – 2025 Edition)
+_Updated for toolchain release **v0.3.0** (packages/imports, “private” visibility, schedule sensors, and semicolon rules)._
 
 This document describes the grammar, semantics, and runtime model for  
 **HASSL** — the *Home Assistant Simple Scripting Language.*
 
 ---
 
+## 📦 Modules & Visibility (NEW in v0.3.0)
+
+HASSL sources live in **packages** and can **import** other packages.
+
+```hassl
+package home.landing
+import std.shared.*        # import all public exports
+import std.lights.aliases  # or import a specific unit (future granular forms)
+```
+
+### Exports
+- **Public** by default.
+- Mark with `private` to keep within the declaring package.
+
+```hassl
+package std.shared
+
+alias landing_light = light.landing_main
+private alias _debug = light.dev_fixture
+
+schedule wake_hours:
+  enable from 07:00 to 23:00;
+```
+
+**Import semantics**:
+- Importers see only public exports.
+- Aliases are injected into the importer’s symbol table (compile-time).
+- Schedules are referenced by name via `schedule use <name>;` and are resolved to schedule **sensors** created by the declaring package (details below).
+
+---
+
 ## 📐 Grammar (EBNF)
 
+> Notes for v0.3.0:
+> - Added `package`, `import`, and `private`.
+> - Semicolons (`;`) are **required only** inside `then` action lists and in `schedule` clause lists.
+> - Top-level statements do **not** require trailing semicolons.
+
 ```ebnf
-program        = { statement } ;
+program        = package_decl? { import_decl | statement } ;
+
+package_decl   = "package" package_name ;
+import_decl    = "import" import_spec ";"? ;
+package_name   = ident {"." ident} ;
+import_spec    = package_name ".*"           # public exports of a package
+               | package_name                # (reserved for future selective)
 
 statement      = alias_stmt | sync_stmt | rule_stmt | schedule_decl ;
 
 # --- Aliases ---
-alias_stmt     = "alias" ident "=" entity ;
+alias_stmt     = ["private"] "alias" ident "=" entity ;
 
 # --- Syncs ---
 sync_stmt      = "sync" sync_type "[" entity_list "]" "as" ident [ sync_opts ] ;
@@ -23,19 +66,20 @@ sync_opts      = "{" [ "invert" ":" entity_list ] "}" ;
 entity_list    = entity { "," entity } ;
 
 # --- Rules ---
-rule_stmt      = "rule" ident ":" { rule_clause } ;
-rule_clause    = if_clause | rule_schedule_use | rule_schedule_inline ;
+rule_stmt      = "rule" ident ":" { rule_item } ;
+rule_item      = if_clause | rule_schedule_use | rule_schedule_inline ;
 
-if_clause      = "if" "(" expression [ qualifier ] ")" [ qualifier ] "then" actions ;
+if_clause      = "if" "(" expression [ qualifier ] ")" [ qualifier ]
+                 "then" actions ;                       # actions require ';' separators
 
 rule_schedule_use    = "schedule" "use" ident_list ";" ;
-rule_schedule_inline = "schedule" schedule_clause+ ;
+rule_schedule_inline = "schedule" schedule_clause+ ;    # clauses end with ';'
 
 ident_list     = ident { "," ident } ;
 
-# --- Schedules ---
-schedule_decl  = "schedule" ident ":" schedule_clause+ ;
-schedule_clause = schedule_op "from" time_spec [ schedule_end ] ";" ;
+# --- Schedules (top-level declaration) ---
+schedule_decl  = "schedule" ident ":" schedule_clause+ ;  # clauses end with ';'
+schedule_clause = schedule_op ["from" time_spec] [ schedule_end ] ";" ;
 schedule_op    = "enable" | "disable" ;
 schedule_end   = "to" time_spec | "until" time_spec ;
 
@@ -58,8 +102,12 @@ comparison     = operand ( "==" | "!=" | "<" | ">" | "<=" | ">=" ) value
 
 operand        = entity | ident | state | number | string ;
 
+# --- Qualifiers (loop/feedback guards) ---
+qualifier      = "not_by" ("this" | "any_hassl" | rule_ref) ;
+rule_ref       = "rule" "(" string | ident ")" ;
+
 # --- Actions ---
-actions        = action { ";" action } ;
+actions        = action { ";" action } ;                # semicolons required here
 action         = assignment | attr_assign | wait_action | rule_ctrl | tag_action ;
 
 assignment     = ident "=" state [ "for" duration ] ;
@@ -78,221 +126,150 @@ state          = "on" | "off" ;
 duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
 ```
 
+### Semicolon Rules (v0.3.0)
+- **Required** between actions in `then` blocks and between `schedule` clauses.
+- **Optional/unused** elsewhere (e.g., after `import` is allowed, but not required).
+
 ---
 
 ## ⚙️ Semantics Overview
 
-### 🧩 **Aliases**
+### 🧩 Aliases (public & private)
 ```hassl
 alias light  = light.wesley_lamp
-alias motion = binary_sensor.wesley_motion_motion
-alias lux    = sensor.wesley_motion_illuminance
+private alias _debug = light.test_fixture
 ```
-- Compile-time substitution for entities.
-- Simplifies long entity IDs.
-- Aliases are expanded before parsing rules or syncs.
+- **Public** (default) aliases are importable with `import pkg.*`.
+- **Private** aliases remain within the defining package.
+- Codegen resolves aliases **in expressions and actions** before emitting YAML targets.
 
----
-
-### 🔄 **Syncs**
+### 🔄 Syncs
 ```hassl
 sync shared [light.desk, light.strip, light.lamp] as work_sync
 sync all [light.kitchen, switch.kitchen_circuit] as kitchen_sync
 sync dimmer [light.desk, light.strip] as office_sync { invert: light.strip }
 ```
+- Emit helpers (`input_boolean/input_number/input_text`) as proxies.
+- **Upstream** changes (device → proxy) only write when **not** originated by HASSL (context guard).
+- **Downstream** changes (proxy → device) use stamped writer scripts to prevent loops.
+- Supports `brightness`, `color_temp`, `kelvin`, `hs_color`, `percentage`, `preset_mode`, `volume`, `mute`.
+- `kelvin` emits **dual data** (`kelvin` + computed `color_temp`) for compatibility.
 
-#### Supported kinds
-| Type        | Behavior |
-|--------------|-----------|
-| `onoff`      | Sync binary state only. |
-| `dimmer`     | Sync on/off + brightness + optional color_temp. |
-| `shared`     | Sync all attributes shared across *all* members. |
-| `all`        | Sync attributes present in *at least two* members. |
-
-#### Features
-- **invert** option reverses on/off for specified members.
-- **Context-aware** — uses HA’s `context.id` for loop prevention.
-- **Automatically creates** matching helpers (`input_boolean`, `input_number`, `input_text`).
-
-#### Upstream (device → proxy)
-- Trigger on any device attribute change.
-- Update proxy helper **only if change did not originate from HASSL**.
-- Mode: `restart` (latest state wins).
-
-#### Downstream (proxy → devices)
-- Trigger on proxy helper change.
-- For each member whose value differs, call a **writer script** to set the new value.
-- Writer scripts stamp context IDs so the upstream guard can recognize their origin.
-
----
-
-### 🧠 **Rules**
+### 🧠 Rules
 ```hassl
 rule motion_light:
-  if (motion && lux < 50) then light = on;
+  schedule use wake_hours;
+  if (motion && lux < 20) then light = on;
   wait (!motion for 10m) light = off
 ```
+- Boolean expressions support `&&`, `||`, `!`, comparisons, and aliases.
+- **Qualifiers** (loop protection): `not_by this`, `not_by any_hassl`, `not_by rule("other")`.
+- Each rule has a gate: `input_boolean.hassl_gate_<rule_name>` (default **on**).
 
-#### Components
-- **Conditions:** standard boolean logic (`&&`, `||`, `!`, comparisons)
-- **Actions:** `assignment`, `attr_assign`, `wait`, `rule_ctrl`, `tag`
-- **Qualifiers:**  
-  - `not_by this` → ignore self-triggered writes  
-  - `not_by rule("other")` → ignore another rule’s writes  
-  - `not_by any_hassl` → ignore all HASSL writes  
-
-#### Example with qualifier
-```hassl
-rule landing_manual_off:
-  if (light == off) not_by any_hassl
-  then disable rule motion_light for 3m
-```
-
----
-
-### ⏳ **Waits**
+### ⏳ Waits
 ```hassl
 wait (!motion for 10m) light = off
 ```
-- Compiled to HA `wait_for_trigger` with duration.
-- Interrupts if rule restarts before completion.
-- Common for occupancy or timeout logic.
+- Compiles to `wait_for_trigger` with a `template` trigger and `for` duration.
+- Rule restarts cancel outstanding waits (`mode: restart`).
 
----
-
-### 🔒 **Rule Control**
-Each rule compiles to:
-```yaml
-input_boolean.hassl_gate_<rule_name>
-```
-Used to globally enable/disable rule activity.
-
-Actions:
+### 🔒 Rule Control
 ```hassl
 disable rule motion_light for 3m
-enable rule night_scene for 1h
+enable rule night_scene until sunrise+15m
 ```
 
----
-
-### 🏷 **Tags**
-```hassl
-tag override = "manual"
-```
-- Stored as `input_text.hassl_tag_<name>`.
-- Useful for tracking manual overrides or context.
-
----
-
-### 🕒 **Schedules**
-Schedules are first-class gates controlling automation availability.
-
-#### Top-level schedule declarations
+### 🕒 Schedules (v0.3.0 tooling behavior)
+#### Top-level Declarations
 ```hassl
 schedule wake_hours:
-  enable from 08:00 until 19:00;
+  enable from 07:00 to 23:00;
 ```
+**package.py** emits a **template binary_sensor** per named schedule:
+```
+binary_sensor.hassl_schedule_<package>_<name>_active
+```
+- `state:` is a safe Jinja expression (no `{% %}` inside `{{ }}`) using:
+  - clock windows with wrap (e.g., `22:00..06:00`),
+  - sun windows with offsets (e.g., `sunrise+15m`),
+  - OR-of-ENABLE minus OR-of-DISABLE clauses.
+- Rules that `schedule use <name>;` add a `condition: state` on that sensor.
+- Importing packages **reuses** the declaring package’s sensor name; rules_min resolves the correct sensor by the schedule’s **base name** and the **declaring package**.
 
-Creates:
-- `input_boolean.hassl_schedule_wake_hours`
-- Automations that:
-  - Turn it ON at 08:00
-  - Turn it OFF at 19:00
-  - Maintain state correctly on restart or mid-day install
-
-#### Inline rule schedules
+#### Inline Rule Schedules
 ```hassl
-rule motion_light:
-  schedule enable from sunset to sunrise;
-  if (motion && lux < 50) then light = on
+rule porch:
+  schedule
+    enable from sunset until 23:00;
+  if (motion) then light = on
 ```
-
-Creates a per-rule schedule gate:
-- `input_boolean.hassl_schedule_rule_motion_light`
-- Rule triggers only when the gate is ON.
-
-#### Reuse schedules
-```hassl
-rule wesley_motion_light:
-  schedule use wake_hours;
-  if (motion && lux < 50) then light = on;
-  wait (!motion for 10m) light = off
-```
-
-Each referenced schedule acts as an extra `condition: state` gate in Home Assistant.
+- No helpers created; rules_min compiles inline schedule clauses into HA `condition:` blocks (sun/clock/templated window checks).
 
 ---
 
-### 💡 **Attribute Assignments**
+## 💡 Attribute Assignments
 ```hassl
 light.brightness = 255
-light.kelvin = 2700
+light.kelvin = 2700        # also emits color_temp fallback
 ```
-
-#### Supported targets
-- `brightness` → numeric 0–255  
-- `color_temp` → mireds  
-- `kelvin` → Kelvin, auto-converted to `color_temp` for compatibility  
-- `color_temp_kelvin` → synonym for `kelvin`  
-
-When `kelvin` is used, HASSL emits both:
-```yaml
-service: light.turn_on
-data:
-  kelvin: 2700
-  color_temp: 370  # for backward compatibility
-```
+- `brightness` uses `light.turn_on` with `brightness` data.
+- `kelvin` uses `light.turn_on` with `kelvin` and a computed `color_temp` fallback.
+- Other attributes default to `homeassistant.turn_on` with data.
 
 ---
 
-## ⚙️ **Runtime Guarantees**
-
+## 🧯 Runtime Guarantees
 | Guarantee | Description |
-|------------|--------------|
-| **Loop-safe** | Every automation stamps its context to prevent self-retriggering. |
-| **Restart-safe** | Schedule booleans re-evaluate on HA start or every minute. |
-| **Deterministic** | Evaluations occur only when dependencies change. |
-| **Composable** | Rules, syncs, and schedules can coexist without cross-collision. |
-| **Human-readable** | Generated YAML uses consistent names: `hassl_<scope>_<name>_<attr>` |
+|------------|-------------|
+| **Loop-safe** | Every write stamps `context.id`; upstream guards ignore our own writes. |
+| **Restart-safe** | Schedule sensors re-evaluate continuously (templates use time/sun/state). |
+| **Deterministic** | Triggers come only from referenced entities; `mode: restart` ensures latest state wins. |
+| **Composable** | Rules, syncs, schedules, and imports can be combined safely. |
+| **Readable** | Emitted YAML names are predictable: `hassl_<scope>_<name>_<attr>` and schedule sensors as above. |
 
 ---
 
-## ✅ **End-to-End Example**
+## ✅ End-to-End Example
 
 ```hassl
-alias light  = light.wesley_lamp
-alias motion = binary_sensor.wesley_motion_motion
-alias lux    = sensor.wesley_motion_illuminance
+package home.landing
+import std.shared.*
+
+alias motion = binary_sensor.landing_motion
+alias lux    = sensor.landing_lux
+alias light  = light.landing_main
 
 schedule wake_hours:
   enable from 08:00 until 19:00;
 
-rule wesley_motion_light:
+rule motion_light:
   schedule use wake_hours;
   if (motion && lux < 50)
   then light = on;
   wait (!motion for 10m) light = off
-
-rule landing_manual_off:
-  if (light == off) not_by any_hassl
-  then disable rule wesley_motion_light for 3m
 ```
 
 Generates:
-- ✅ Schedules that track real time and restart cleanly.  
-- ✅ Context-aware automations for motion logic.  
-- ✅ A gate toggle (`input_boolean.hassl_gate_wesley_motion_light`) to disable logic for manual use.
+- `binary_sensor.hassl_schedule_home.landing_wake_hours_active` (sensor id normalized).
+- A rule automation gated by the schedule sensor and the rule gate boolean.
+- Context-stamped writes and safe waits.
 
 ---
 
-## 🚀 **Versioning & Backward Compatibility**
+## 🧭 Versioning
 
 | Feature | Introduced | Notes |
-|----------|-------------|-------|
-| `sync all` / `shared` | v1.0 | Multi-device synchronization |
-| `not_by` guards | v1.1 | Context-safe rule evaluation |
-| `wait (...)` blocks | v1.2 | Continuous state waits |
-| `schedule` blocks | v1.3 | Declarative time-of-day gating |
-| `kelvin` support | v1.4 | Native + color_temp fallback |
-| `restart maintenance` for schedules | v1.4 | Evaluates schedule booleans at startup |
+|--------|------------|-------|
+| Modules (`package`/`import`) | v0.3.0 | Public/private exports; alias & schedule import behavior |
+| Schedule **sensors** in codegen | v0.3.0 | Emitted by `package.py` as template binary_sensors |
+| Inline schedule → conditions | v0.3.0 | No helpers; compiled to `condition:` blocks |
+| Kelvin fallback | v1.4 | Emits `kelvin` + `color_temp` |
+| `wait (...)` | v1.2 | Template wait triggers |
+| `not_by` guards | v1.1 | Loop prevention |
 
+---
+
+## ℹ️ Notes & Limitations
+- Semicolons are only significant in **action lists** and **schedule clause** lists.
+- Schedule sensor IDs include the **declaring package** slug and the **base schedule name**; consumers should not hardcode the declaring package—use `rules_min` to resolve imported usage.
+- Future releases may add grouped attribute assignments and enhanced error reporting.
