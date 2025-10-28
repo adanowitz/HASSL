@@ -404,14 +404,52 @@ def generate_rules(ir, outdir):
         rname = rule["name"]
         gate = _gate_entity(rname)
 
-        # gather schedule conditions for this rule
-        cond_schedule_entities = []
-
-        # 1) named schedules used by this rule → state('on') of the schedule sensor
-        for nm in use_by_rule.get(rname, []) or []:
-            base = str(nm).split(".")[-1]
-            decl_pkg = exported_sched_pkgs.get(base, pkg)
-            cond_schedule_entities.append(_schedule_sensor(base, decl_pkg))
+        # Build per-schedule gate conditions.
+         # For each referenced schedule, OR together its possible gate entities
+         # (e.g., input_boolean.hassl_sched_* OR binary_sensor.hassl_schedule_*_active).
+        schedule_gate_conditions = []
+ 
+        rule_gates = list(rule.get("schedule_gates") or []) if isinstance(rule, dict) else []
+        used_names = list(use_by_rule.get(rname, []) or [])
+ 
+        if rule_gates:
+            for g in rule_gates:
+                ents = [e for e in (g.get("entities") or []) if isinstance(e, str)]
+                # Also include the legacy, current-outdir slug binary_sensor expected by older tests/code
+                # Determine the base schedule name, then synthesize the local sensor id.
+                resolved = str(g.get("resolved", "")) if isinstance(g.get("resolved", ""), str) else ""
+                base = resolved.rsplit(".", 1)[-1] if resolved else None
+                if base:
+                    legacy_local = _schedule_sensor(base, pkg)  # e.g., binary_sensor.hassl_schedule_out_std_<base>_active
+                    if legacy_local not in ents:
+                        ents.append(legacy_local)
+                        
+                if not ents:
+                    continue
+                if len(ents) == 1:
+                    schedule_gate_conditions.append({
+                        "condition": "state",
+                        "entity_id": ents[0],
+                        "state": "on"
+                    })
+                else:
+                    schedule_gate_conditions.append({
+                        "condition": "or",
+                        "conditions": [
+                            {"condition": "state", "entity_id": e, "state": "on"}
+                            for e in ents
+                        ]
+                    })
+        else:
+            # Legacy fallback: only the template binary_sensor is known.
+            for nm in used_names:
+                base = str(nm).split(".")[-1]
+                decl_pkg = exported_sched_pkgs.get(base, pkg)
+                schedule_gate_conditions.append({
+                    "condition": "state",
+                    "entity_id": _schedule_sensor(base, decl_pkg),
+                    "state": "on"
+                })
 
         # 2) inline schedule clauses → compile directly to HA conditions (no helpers)
         inline_clauses = inline_by_rule.get(rname, []) or []
@@ -419,9 +457,6 @@ def generate_rules(ir, outdir):
         for cl in inline_clauses:
             if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
                 inline_schedule_conditions.append(_schedule_clause_to_condition(cl))
-
-        # de-dup schedule conditions
-        cond_schedule_entities = sorted(set(cond_schedule_entities))
 
         # Now process each 'if' clause
         for idx, clause in enumerate(rule["clauses"]):
@@ -440,8 +475,10 @@ def generate_rules(ir, outdir):
             cond_ha = _condition_to_ha(cond_in)
             gate_cond = {"condition": "state", "entity_id": gate, "state": "on"}
 
-            # schedule gate conditions (all must be satisfied)
-            sched_conds = [{"condition":"state","entity_id": e,"state":"on"} for e in cond_schedule_entities]
+            # schedule gate conditions (all must be satisfied);
+            # each item in schedule_gate_conditions is already either a state check
+            # or an OR of multiple state checks for a single schedule.
+            sched_conds = list(schedule_gate_conditions)
             if inline_schedule_conditions:
                 sched_conds.extend(inline_schedule_conditions)
 
