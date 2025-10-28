@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: hassl
-Version: 0.2.1
+Version: 0.3.0
 Summary: HASSL: Home Assistant Simple Scripting Language
 Home-page: https://github.com/adanowitz/hassl
 Author: adanowitz
@@ -17,6 +17,8 @@ Dynamic: license-file
 
 > **Home Assistant Simple Scripting Language**
 
+![Version](https://img.shields.io/badge/version-v0.3.0-blue)
+
 HASSL is a human-friendly domain-specific language (DSL) for building **loop-safe**, **deterministic**, and **composable** automations for [Home Assistant](https://www.home-assistant.io/).
 
 It compiles lightweight `.hassl` scripts into fully functional YAML packages that plug directly into Home Assistant, replacing complex automations with a clean, readable syntax.
@@ -32,11 +34,14 @@ It compiles lightweight `.hassl` scripts into fully functional YAML packages tha
 - **Per-rule enable gates** → `disable rule` or `enable rule` dynamically
 - **Inline waits** → `wait (!motion for 10m)` works like native HA triggers
 - **Color temperature in Kelvin** → `light.kelvin = 2700`
+- **Modular packages/imports** → split automations across files with public/private exports (v0.3.0)
 - **Auto-reload resilience** → schedules re-evaluate automatically on HA restart
 
 ---
 
 ## 🧰 Example
+
+### Basic standalone script
 
 ```hassl
 alias light  = light.wesley_lamp
@@ -63,6 +68,45 @@ Produces a complete Home Assistant package with:
 - Context-aware writer scripts
 - Sync automations for linked devices
 - Rule-based automations with schedules and `not_by` guards
+
+### Using imports across packages
+
+```hassl
+# packages/std/shared.hassl
+package std.shared
+
+alias light  = light.wesley_lamp
+alias motion = binary_sensor.wesley_motion_motion
+alias lux    = sensor.wesley_motion_illuminance
+
+schedule wake_hours:
+  enable from 08:00 until 19:00;
+```
+
+```hassl
+# packages/home/landing.hassl
+package home.landing
+import std.shared.*
+
+rule wesley_motion_light:
+  schedule use wake_hours;
+  if (motion && lux < 50)
+  then light = on;
+  wait (!motion for 10m) light = off
+
+rule landing_manual_off:
+  if (light == off) not_by any_hassl
+  then disable rule wesley_motion_light for 3m
+```
+
+This setup produces:
+- One **shared package** defining reusable aliases and schedules  
+- A **landing package** importing and reusing those exports  
+
+Together, they generate:
+- ✅ Shared schedule sensor (`binary_sensor.hassl_schedule_std_shared_wake_hours_active`)  
+- ✅ Cross-package rule automations gated by that schedule  
+- ✅ Context-safe helpers and syncs for both packages  
 
 ---
 
@@ -103,6 +147,7 @@ Each `.hassl` file compiles into an isolated package — no naming collisions, n
 | `scripts_<pkg>.yaml`       | Writer scripts with context stamping          |
 | `sync_<pkg>_*.yaml`        | Sync automations for each property            |
 | `rules_bundled_<pkg>.yaml` | Rule logic automations + schedules            |
+| `schedules_<pkg>.yaml`     | Time/sun-based schedule sensors (v0.3.0)      |
 
 ---
 
@@ -120,7 +165,7 @@ Each `.hassl` file compiles into an isolated package — no naming collisions, n
 
 ## 🔒 Loop Safety & Context Tracking
 
-HASSL automatically writes the **parent context ID** into helper entities before performing actions.\
+HASSL automatically writes the **parent context ID** into helper entities before performing actions.  
 This ensures `not_by any_hassl` and `not_by rule("name")` guards work flawlessly, preventing infinite feedback.
 
 ---
@@ -129,23 +174,22 @@ This ensures `not_by any_hassl` and `not_by rule("name")` guards work flawlessly
 
 All schedules are restart-safe:
 
-- `input_boolean.hassl_schedule_<name>` automatically re-evaluates on startup.
-- Triggers are set for both start and end times.
+- `binary_sensor.hassl_schedule_<package>_<name>_active` automatically re-evaluates on startup.
+- Clock and sun-based windows update continuously through HA’s template engine.
 - Missed events (like mid-day restarts) are recovered automatically.
 
 ---
 
 ## 📚 Documentation
 
-For full grammar and detailed semantics, see the [HASSL Language Specification](./HASSL_Specification.md).
-
-For a hands-on guide, check out the [Quickstart](./quickstart.md).
+- [Quickstart Guide](./quickstart_v1.4_2025_v0.3.0.md)
+- [Language Specification](./hassl_language_spec_v1.4_2025_updated_v0.3.0.md)
 
 ---
 
 ## 🧩 Contributing
 
-Contributions, tests, and ideas welcome!\
+Contributions, tests, and ideas welcome!  
 To run tests locally:
 
 ```bash
@@ -158,10 +202,9 @@ Please open pull requests for grammar improvements, new device domains, or sched
 
 ## 📄 License
 
-MIT License © 2025\
+MIT License © 2025  
 Created and maintained by [@adanowitz](https://github.com/adanowitz)
 
 ---
 
 **HASSL** — simple, reliable, human-readable automations for Home Assistant.
-

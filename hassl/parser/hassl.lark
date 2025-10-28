@@ -9,7 +9,8 @@ stmt: package_decl
     | alias
     | sync
     | rule
-    | schedule_decl           
+    | schedule_decl
+    | holidays_decl
 
 // --- Aliases ---
 alias: PRIVATE? "alias" CNAME "=" entity //can mark private
@@ -105,7 +106,35 @@ OFFSET: /[+-]\d+(ms|s|m|h|d)/
 schedule_decl: PRIVATE? SCHEDULE CNAME ":" schedule_clause+
 
 // Clauses usable both in declarations and inline
-schedule_clause: schedule_op FROM time_spec schedule_end? ";"
+// Keep legacy form AND add new 'on …' forms
+schedule_clause: schedule_legacy_clause
+               | schedule_new_clause
+
+// Legacy (unchanged)
+schedule_legacy_clause: schedule_op FROM time_spec schedule_end? ";"
+
+// NEW schedule window syntax:
+//   [during <period>] on (weekdays|weekends|daily) HH:MM-HH:MM [except holidays <id>] ;
+//   on holidays <id> HH:MM-HH:MM ;
+schedule_new_clause: period? "on" day_selector time_range holiday_mod? ";"
+                   | "on" "holidays" CNAME time_range ";"
+
+// Periods
+period: "during" "months" month_range
+      | "during" "dates"  mmdd_range
+      | "during" "range"  ymd_range
+
+month_range: MONTH (".." MONTH)? ("," MONTH)*
+MONTH.2: "Jan"|"Feb"|"Mar"|"Apr"|"May"|"Jun"|"Jul"|"Aug"|"Sep"|"Oct"|"Nov"|"Dec"
+mmdd_range: MMDD ".." MMDD
+MMDD: /\d{2}-\d{2}/
+ymd_range: YMD ".." YMD
+YMD: /\d{4}-\d{2}-\d{2}/
+
+day_selector: "weekdays" | "weekends" | "daily"
+time_range: TIME_HHMM "-" TIME_HHMM
+holiday_mod: "except" "holidays" CNAME
+
 schedule_op: ENABLE | DISABLE
 schedule_end: TO time_spec    -> schedule_to
             | UNTIL time_spec -> schedule_until
@@ -158,3 +187,20 @@ import_tail: ".*"
            | "as" CNAME
 import_list: import_item ("," import_item)*
 import_item: CNAME ("as" CNAME)?
+
+// ---- Holidays declaration (NEW) ----
+// Example:
+// holidays us_ca:
+//   country="US", province="CA", add=["2025-11-28"], remove=["2025-12-26"]
+holidays_decl: "holidays" CNAME ":" holi_kv ("," holi_kv)*
+holi_kv: "country" "=" STRING
+       | "province" "=" STRING
+       | "workdays" "=" "[" daylist "]"            -> holi_workdays
+       | "excludes" "=" "[" excludelist "]"        -> holi_excludes
+       | "add" "=" "[" datestr_list "]"
+       | "remove" "=" "[" datestr_list "]"
+daylist: DAY ("," DAY)*
+excludelist: ("sat"|"sun"|"holiday") ("," ("sat"|"sun"|"holiday"))*
+DAY.2: "mon"|"tue"|"wed"|"thu"|"fri"|"sat"|"sun"
+DATESTR: /"\d{4}-\d{2}-\d{2}"/
+datestr_list: DATESTR ("," DATESTR)*

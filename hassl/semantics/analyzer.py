@@ -1,6 +1,9 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple
-from ..ast.nodes import Program, Alias, Sync, Rule, Schedule
+from ..ast.nodes import (
+    Program, Alias, Sync, Rule, Schedule,
+    HolidaySet, ScheduleWindow, PeriodSelector,
+    )
 from .domains import DOMAIN_PROPS, domain_of
 
 @dataclass
@@ -21,13 +24,21 @@ class IRRule:
     clauses: List[dict]
     schedule_uses: Optional[List[str]] = None
     schedules_inline: Optional[List[dict]] = None
-
+    # NEW: for each schedule use, the emitter can gate on ANY of these entity ids.
+    # List of {"resolved": "pkg.name", "entities": [entity_id, ...]}
+    schedule_gates: Optional[List[Dict[str, Any]]] = None
+    
 @dataclass
 class IRProgram:
     aliases: Dict[str, str]
     syncs: List[IRSync]
     rules: List[IRRule]
+    # Legacy schedule clauses (enable/disable from …)
     schedules: Optional[Dict[str, List[dict]]] = None
+    # NEW: structured windows keyed by schedule name
+    schedules_windows: Dict[str, List[dict]] = field(default_factory=dict)
+    # NEW: declared holiday sets (by id)
+    holidays: Dict[str, dict] = field(default_factory=dict)
     
     def to_dict(self):
         return {
@@ -40,7 +51,9 @@ class IRProgram:
                 "name": r.name,
                 "clauses": r.clauses,
                 "schedule_uses": r.schedule_uses or [],
-                "schedules_inline": r.schedules_inline or []
+                "schedules_inline": r.schedules_inline or [],
+                # surface gates so codegen can choose correct binary_sensor/input_boolean
+                "schedule_gates": r.schedule_gates or [],
             } for r in self.rules],
             "schedules": self.schedules or {},
         }
@@ -96,6 +109,8 @@ def analyze(prog: Program) -> IRProgram:
     local_aliases: Dict[str, str] = {}
     local_schedules: Dict[str, List[dict]] = {}
     local_public: Dict[Tuple[str, str, str], Any] = {}  # (pkg, kind, name) -> node
+    local_schedule_windows: Dict[str, List[ScheduleWindow]] = {}
+    local_holidays: Dict[str, HolidaySet] = {}
 
     # 1) Collect local declarations (aliases & schedules)
     for s in prog.statements:
@@ -113,8 +128,12 @@ def analyze(prog: Program) -> IRProgram:
                     local_public[(package_name, "schedule", name)] = Schedule(name=name, clauses=s.get("clauses", []), private=False)
         elif isinstance(s, Schedule):
             local_schedules.setdefault(s.name, []).extend(s.clauses or [])
+            if getattr(s, "windows", None):
+                local_schedule_windows.setdefault(s.name, []).extend(s.windows or [])
             if not getattr(s, "private", False):
                 local_public[(package_name, "schedule", s.name)] = s
+        elif isinstance(s, HolidaySet):
+            local_holidays[s.id] = s
 
     # 2) Build import view
     # Maps for analysis:
@@ -150,6 +169,15 @@ def analyze(prog: Program) -> IRProgram:
             continue
         mod = imp.get("module", "")
         kind = imp.get("kind")
+        # Be generous: if transformer emitted "none" or omitted kind, infer it.
+        if kind not in ("glob", "list", "alias"):
+            if imp.get("items"):
+                kind = "list"
+            elif imp.get("as"):
+                kind = "alias"
+            else:
+                kind = "glob"
+        
         _check_import_exists(mod)
         if kind == "glob":
             # bring in all public aliases & schedules from 'mod'
@@ -203,8 +231,49 @@ def analyze(prog: Program) -> IRProgram:
     for nm, cls in local_schedules.items():
         scheds.setdefault(nm, []).extend(cls)
 
+    # NEW: collect structured windows (serialize to plain dicts)
+    sched_windows: Dict[str, List[dict]] = {}
+    for nm, wins in local_schedule_windows.items():
+        out: List[dict] = []
+        for w in wins:
+            if not isinstance(w, ScheduleWindow):
+                continue
+            # flatten PeriodSelector to dict for IR portability
+            period = None
+            if getattr(w, "period", None):
+                p = w.period  # PeriodSelector
+                period = {"kind": p.kind, "data": dict(p.data)}
+            out.append({
+                "start": w.start,
+                "end": w.end,
+                "day_selector": w.day_selector,
+                "period": period,
+                "holiday_ref": w.holiday_ref,
+                "holiday_mode": w.holiday_mode,
+           })
+        if out:
+            sched_windows[nm] = out
+
     # --- Rules (with schedule use/inline) ---
     rules: List[IRRule] = []
+
+    def _safe(s: str) -> str:
+        return (s or "").replace(".", "_")
+
+    def _gate_entities_for(resolved: str) -> List[str]:
+        """
+        Return both possible entity ids for a resolved schedule name 'pkg.name'.
+        - Legacy (template binary_sensor): binary_sensor.hassl_schedule_<pkg>_<name>_active
+        - New windows (input_boolean):     input_boolean.hassl_sched_<pkg>_<name>
+        We include BOTH so downstream rule emitters can OR them safely.
+        """
+        if "." in resolved:
+            pkg, nm = resolved.rsplit(".", 1)
+        else:
+            pkg, nm = (prog.package or ""), resolved
+        legacy = f"binary_sensor.hassl_schedule_{_safe(pkg)}_{_safe(nm)}_active".lower()
+        window = f"input_boolean.hassl_sched_{_safe(pkg)}_{_safe(nm)}".lower()
+        return [window, legacy]
 
     def _resolve_qualified_alias(name: str) -> Optional[str]:
         """
@@ -269,18 +338,28 @@ def analyze(prog: Program) -> IRProgram:
             clauses: List[dict] = []
             schedule_uses: List[str] = []
             schedules_inline: List[dict] = []
+            # Per-rule collection of precomputed gate entities
+            schedule_gates: List[Dict[str, Any]] = []
 
             for c in s.clauses:
                 # IfClause-like items have .condition/.actions
                 if hasattr(c, "condition") and hasattr(c, "actions"):
-                    cond = _walk_alias_with_qualified(c.condition)
-                    acts = _walk_alias_with_qualified(c.actions)
+                    # Keep alias identifiers intact for tests & codegen (resolve later)
+                    cond = c.condition
+                    acts = c.actions
                     clauses.append({"condition": cond, "actions": acts})
                 elif isinstance(c, dict) and c.get("type") == "schedule_use":
                     # {"type":"schedule_use","names":[...]}
                     raw = [str(n) for n in (c.get("names") or []) if isinstance(n, str)]
-                    # normalize each schedule name
-                    schedule_uses.extend([_resolve_schedule_name(n) for n in raw])
+
+                    # The IR should keep base names (tests assert on this)
+                    schedule_uses.extend(raw)
+                    # But also compute resolved names for gate entities (pkg.name when known)
+                    resolved = [_resolve_schedule_name(n) for n in raw]
+                    # precompute gates for emitters (binary_sensor + input_boolean forms)
+                    for rname in resolved:
+                        schedule_gates.append({"resolved": rname, "entities": _gate_entities_for(rname)})
+
                 elif isinstance(c, dict) and c.get("type") == "schedule_inline":
                     # {"type":"schedule_inline","clauses":[...]}
                     for sc in c.get("clauses") or []:
@@ -294,12 +373,43 @@ def analyze(prog: Program) -> IRProgram:
                 name=s.name,
                 clauses=clauses,
                 schedule_uses=schedule_uses,
-                schedules_inline=schedules_inline
+                schedules_inline=schedules_inline,
+                schedule_gates=schedule_gates
             ))
+
+    # -------- NEW: validate schedule windows --------
+    allowed_days = {"weekdays", "weekends", "daily"}
+    for sched_name, wins in sched_windows.items():
+        for w in wins:
+            ds = w.get("day_selector")
+            if ds not in allowed_days:
+                raise ValueError(f"schedule '{sched_name}': invalid day selector '{ds}'")
+            href = w.get("holiday_ref")
+            hmode = w.get("holiday_mode")
+            if href:
+                if hmode not in ("except", "only"):
+                    raise ValueError(f"schedule '{sched_name}': holiday ref '{href}' requires 'except' or 'only'")
+                if href not in local_holidays:
+                    raise ValueError(f"schedule '{sched_name}': unknown holidays '{href}'")
+
+    # materialize holidays into plain dicts for IR
+    holidays_ir: Dict[str, dict] = {}
+    for hid, h in local_holidays.items():
+        holidays_ir[hid] = {
+            "id": h.id,
+            "country": h.country,
+            "province": h.province,
+            "add": list(h.add),
+            "remove": list(h.remove),
+            "workdays": list(h.workdays),
+            "excludes": list(h.excludes),
+        }
 
     return IRProgram(
         aliases=amap,
         syncs=syncs,
         rules=rules,
-        schedules=scheds
+        schedules=scheds,
+        schedules_windows=sched_windows,
+        holidays=holidays_ir
     )

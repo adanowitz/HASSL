@@ -1,4 +1,4 @@
-from typing import Dict, List, Iterable, Any
+from typing import Dict, List, Iterable, Any, Tuple
 import os, re
 from dataclasses import dataclass, field
 from ..semantics.analyzer import IRProgram, IRSync
@@ -78,6 +78,13 @@ def _context_entity(entity: str, prop: str = None) -> str:
 def _domain(entity: str) -> str:
     return entity.split(".", 1)[0]
 
+def _gate_entity_for_schedule(resolved: str, is_window: bool) -> str:
+    # resolved is "pkg.name" (your analyzer already normalizes)
+    pkg, name = resolved.rsplit(".", 1) if "." in resolved else ("", resolved)
+    if is_window:
+        return f"input_boolean.hassl_sched_{_safe(pkg)}_{_safe(name)}"
+    return f"binary_sensor.hassl_schedule_{_safe(pkg)}_{_safe(name)}_active"
+
 def _turn_service(domain: str, state_on: bool) -> str:
     if domain in ("light","switch","fan","media_player","cover"):
         return f"{domain}.turn_on" if state_on else f"{domain}.turn_off"
@@ -92,7 +99,8 @@ class ScheduleRegistry:
     pkg: str
     created: Dict[str, str] = field(default_factory=dict)   # name -> entity_id
     sensors: List[Dict] = field(default_factory=list)       # collected template sensors (for YAML)
-
+    period_cache: Dict[Tuple[str,str], str] = field(default_factory=dict)  # (sched, key)-> entity_id
+    
     def eid_for(self, name: str) -> str:
         return f"binary_sensor.hassl_schedule_{self.pkg}_{_safe(name)}_active".lower()
 
@@ -104,6 +112,22 @@ class ScheduleRegistry:
         self.sensors.append(sensor_def)
         self.created[name] = eid
         return eid
+
+    # New: create/reuse a period template sensor for a schedule window
+    def ensure_period_sensor(self, sched_name: str, period: Dict[str, Any] | None) -> str | None:
+        if not period:
+            return None
+        key = (sched_name, str(period))
+        if key in self.period_cache:
+            return self.period_cache[key]
+        # Build a compact name with hash for stability
+        eid_name = f"hassl_period_{self.pkg}_{_safe(sched_name)}_{abs(hash(str(period)))%100000}"
+        entity_id = f"binary_sensor.{eid_name}"
+        tpl = _period_template(period)
+        self.sensors.append({"name": eid_name, "unique_id": eid_name, "state": f"{{{{ {tpl} }}}}"})
+        self.period_cache[key] = entity_id
+        return entity_id
+
 
 def _jinja_offset(offset: str) -> str:
     """
@@ -236,6 +260,49 @@ def _emit_schedule_helper_yaml(entity_id: str, pkg: str, name: str, clauses: Lis
         "state": f"{{{{ {state_tpl} }}}}"
     }
 
+# ---------- NEW: period sensor template builders ----------
+def _period_template(period: Dict[str, Any]) -> str:
+    """
+    period is a dict of shape:
+      {"kind":"months","data":{"list":[Mon,...]}} or {"kind":"months","data":{"range":[A,B]}}
+      {"kind":"dates","data":{"start":"MM-DD","end":"MM-DD"}}   # can wrap year
+      {"kind":"range","data":{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}}
+    Returns a Jinja boolean expression.
+    """
+    kind = period.get("kind")
+    data = period.get("data", {})
+    
+    if kind == "months":
+        def m2n(m: str) -> int:
+            order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            return order.index(m)+1
+        if "list" in data:
+            months = [m2n(m) for m in data["list"]]
+            return f"( now().month in {months} )"
+        if "range" in data:
+            a, b = [m2n(x) for x in data["range"]]
+            return (
+                f"( ({a} <= now().month <= {b}) or "
+                f"  ({a} > {b} and (now().month >= {a} or now().month <= {b})) )"
+            )
+
+    if kind == "dates":
+        # Compare zero-padded strings '%m-%d' (lexicographic works).
+        start = data.get("start"); end = data.get("end")
+        d = "now().strftime('%m-%d')"
+        return (
+            f"( ('{start}' <= {d} <= '{end}') or "
+            f"  ('{start}' > '{end}' and ({d} >= '{start}' or {d} <= '{end}')) )"
+        )
+    if kind == "range":
+        start = data.get("start"); end = data.get("end")
+        # Keep this as a pure expression using filters.
+        return (
+            f"( now().date() >= '{start}'|as_datetime|date and "
+            f"  now().date() <= '{end}'|as_datetime|date )"
+        )
+    return "true"
+
 def _collect_named_schedules(ir: IRProgram) -> Iterable[Dict]:
     """
     Collect named schedules from IR in either object, list, or dict form.
@@ -295,7 +362,6 @@ def _collect_named_schedules(ir: IRProgram) -> Iterable[Dict]:
 def emit_package(ir: IRProgram, outdir: str):
     ensure_dir(outdir)
 
-    print("DEBUG:", getattr(ir, "schedules", None))
     # derive package slug early; use IR package if present
     pkg = getattr(ir, "package", None) or _pkg_slug(outdir)
     sched_reg = ScheduleRegistry(pkg)
@@ -303,12 +369,31 @@ def emit_package(ir: IRProgram, outdir: str):
     helpers: Dict = {"input_text": {}, "input_boolean": {}, "input_number": {}}
     scripts: Dict = {"script": {}}
     automations: List[Dict] = []
-
+    holiday_bs_defs: List[Dict] = [] #workday platform sensors
+    
     # ---------- PASS 1: create named schedule helpers ONCE per (pkg, name) ----------
     for s in _collect_named_schedules(ir):
         if not s.get("name"):
             continue
         sched_reg.register_decl(s["name"], s.get("clauses", []))
+
+    # ---------- PASS 1b: Holidays -> Workday sensors ----------
+    # ir.holidays is {"id": {country, province, add, remove, workdays, excludes}}
+    holidays_ir = getattr(ir, "holidays", {}) or {}
+    if holidays_ir:
+        for hid, h in holidays_ir.items():
+            entry = {
+                "platform": "workday",
+                "name": f"hassl_{hid}_workday",
+                "country": h.get("country") or "US",
+            }
+            if h.get("province"): entry["province"] = h["province"]
+            if h.get("workdays"): entry["workdays"] = list(h["workdays"])
+            if h.get("excludes"): entry["excludes"] = list(h["excludes"])
+            if h.get("add"): entry["add_holidays"] = list(h["add"])
+            if h.get("remove"): entry["remove_holidays"] = list(h["remove"])
+            holiday_bs_defs.append(entry)
+
 
     # ---------- Context helpers for entities & per-prop contexts ----------
     sync_entities = set(); entity_props = {}
@@ -436,11 +521,13 @@ def emit_package(ir: IRProgram, outdir: str):
                     )
                 })
                 
-                proxy_e = (
-                    f"input_text.hassl_{_safe(s.name)}_{prop}"
-                    if PROP_CONFIG.get(prop,{}).get("proxy",{}).get("type") == "input_text"
-                    else f"input_number.hassl_{_safe(s.name)}_{prop}"
-                )
+                ptype = PROP_CONFIG.get(prop, {}).get("proxy", {}).get("type")
+                if ptype == "input_text":
+                    proxy_e = f"input_text.hassl_{_safe(s.name)}_{prop}"
+                elif ptype == "input_boolean":
+                    proxy_e = f"input_boolean.hassl_{_safe(s.name)}_{prop}"
+                else:
+                    proxy_e = f"input_number.hassl_{_safe(s.name)}_{prop}"
 
                 if prop == "mute":
                     actions = [{
@@ -513,11 +600,14 @@ def emit_package(ir: IRProgram, outdir: str):
                     })
                 automations.append({"alias": f"HASSL sync {s.name} downstream onoff","mode":"queued","max":10,"trigger": trigger,"action": actions})
             else:
-                proxy_e = (
-                    f"input_text.hassl_{_safe(s.name)}_{prop}"
-                    if PROP_CONFIG.get(prop,{}).get("proxy",{}).get("type") == "input_text"
-                    else f"input_number.hassl_{_safe(s.name)}_{prop}"
-                )
+                ptype = PROP_CONFIG.get(prop, {}).get("proxy", {}).get("type")
+                if ptype == "input_text":
+                    proxy_e = f"input_text.hassl_{_safe(s.name)}_{prop}"
+                elif ptype == "input_boolean":
+                    proxy_e = f"input_boolean.hassl_{_safe(s.name)}_{prop}"
+                else:
+                    proxy_e = f"input_number.hassl_{_safe(s.name)}_{prop}"
+
                 trigger = [{"platform": "state","entity_id": proxy_e}]
                 actions = []
                 cfg = PROP_CONFIG.get(prop, {})
@@ -551,6 +641,63 @@ def emit_package(ir: IRProgram, outdir: str):
                     })
                 automations.append({"alias": f"HASSL sync {s.name} downstream {prop}","mode":"queued","max":10,"trigger": trigger,"action": actions})
 
+    # ---------- New schedule windows (emit input_boolean + on/off automations) ----------
+    # IR provides schedules_windows: { name: [ {start,end,day_selector,period,holiday_*} ] }
+    sched_windows_ir = getattr(ir, "schedules_windows", {}) or {}
+    per_schedule_automations: Dict[str, List[Dict]] = {}
+    for sched_name, wins in sched_windows_ir.items():
+        # Ensure schedule boolean exists in helpers
+        helpers["input_boolean"][f"hassl_sched_{_safe(sched_name)}"] = {
+            "name": f"HASSL Schedule {sched_name}"
+        }
+        bool_eid = f"input_boolean.hassl_sched_{_safe(sched_name)}"
+
+        for idx, w in enumerate(wins):
+            start = w["start"] + (":00" if len(w["start"])==5 else "")
+            end   = w["end"]   + (":00" if len(w["end"])==5 else "")
+
+            # Build conditions
+            conds: List[Dict[str, Any]] = []
+            ds = w.get("day_selector")
+            if ds == "weekdays":
+                conds.append({"condition": "time", "weekday": ["mon","tue","wed","thu","fri"]})
+            elif ds == "weekends":
+                conds.append({"condition": "time", "weekday": ["sat","sun"]})
+            # holidays
+            href = w.get("holiday_ref"); hmode = w.get("holiday_mode")
+            if href and hmode in ("except","only"):
+                # workday sensor: on => workday (not holiday); off => holiday/weekend
+                conds.append({
+                    "condition": "state",
+                    "entity_id": f"binary_sensor.hassl_{href}_workday",
+                    "state": "on" if hmode == "except" else "off"
+                })
+            # period
+            period = w.get("period")
+
+            period_eid = sched_reg.ensure_period_sensor(sched_name, period)
+            if period_eid:
+                conds.append({"condition":"state", "entity_id": period_eid, "state":"on"})
+
+            def add_auto(suffix: str, at_time: str, turn_on: bool):
+                per_schedule_automations.setdefault(sched_name, []).append({
+                    "alias": f"HASSL schedule {sched_name} {suffix}",
+                    "mode": "single",
+                    "trigger": [{"platform":"time","at": at_time}],
+                    "condition": conds,
+                    "action": [{
+                        "service": "input_boolean.turn_on" if turn_on else "input_boolean.turn_off",
+                        "target": {"entity_id": bool_eid}
+                    }]
+                })
+
+            # If window crosses midnight (start > end), we still generate simple time-based on/off.
+
+
+            # HA will run the 'end' next morning; no extra split needed because conditions gate by day/period/holiday.
+            add_auto(f"on_{idx}", start, True)
+            add_auto(f"off_{idx}", end, False)
+
     # ---------- Write YAML ----------
     # helpers & scripts
     _dump_yaml(os.path.join(outdir, f"helpers_{pkg}.yaml"), helpers, ensure_sections=True)
@@ -563,8 +710,23 @@ def emit_package(ir: IRProgram, outdir: str):
             {"template": [{"binary_sensor": sched_reg.sensors}]}
         )
 
+    # holidays workday sensors
+    if holiday_bs_defs:
+        _dump_yaml(
+            os.path.join(outdir, f"holidays_{pkg}.yaml"),
+            {"binary_sensor": holiday_bs_defs}
+        )
+        
     # automations per sync
     for s in ir.syncs:
         doc = [a for a in automations if a["alias"].startswith(f"HASSL sync {s.name}")]
         if doc:
             _dump_yaml(os.path.join(outdir, f"sync_{pkg}_{_safe(s.name)}.yaml"), {"automation": doc})
+
+    # automations per schedule (new windows)
+    for sched_name, autos in per_schedule_automations.items():
+        if autos:
+            _dump_yaml(
+                os.path.join(outdir, f"schedule_{pkg}_{_safe(sched_name)}.yaml"),
+                {"automation": autos}
+            )

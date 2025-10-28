@@ -302,10 +302,13 @@ class HasslTransformer(Transformer):
         name = str(parts[idx]); idx += 1
         if idx < len(parts) and isinstance(parts[idx], Token) and str(parts[idx]) == ":":
             idx += 1
+        # Legacy clauses (enable/disable from ... to/until ...)
         clauses = [c for c in parts[idx:] if isinstance(c, dict) and c.get("type") == "schedule_clause"]
-        node = {"type": "schedule_decl", "name": name, "clauses": clauses, "private": private}
-        self.stmts.append(node)
-        return node
+        # New-form windows (nodes.ScheduleWindow)
+        windows = [w for w in parts[idx:] if isinstance(w, nodes.ScheduleWindow)]
+        sched = nodes.Schedule(name=name, clauses=clauses, windows=windows, private=private)
+        self.stmts.append(sched)
+        return sched
     
     # rule_schedule_use: SCHEDULE USE name_list ";"
     def rule_schedule_use(self, _sched_kw, _use_kw, names, _semi=None):
@@ -317,8 +320,15 @@ class HasslTransformer(Transformer):
         clist = [c for c in clauses if isinstance(c, dict) and c.get("type") == "schedule_clause"]
         return {"type": "schedule_inline", "clauses": clist}
 
-    # schedule_clause: schedule_op FROM time_spec schedule_end? ";"
-    def schedule_clause(self, op, _from_kw, start, end=None, _semi=None):
+    # schedule_clause is now an alternation:
+    #   schedule_clause: schedule_legacy_clause | schedule_new_clause
+    # Lark passes the single child. Just forward it.
+    def schedule_clause(self, item):
+        return item
+
+    # Legacy shape stays the same; build the dict here.
+    # schedule_legacy_clause: schedule_op FROM time_spec schedule_end? ";"
+    def schedule_legacy_clause(self, op, _from_kw, start, end=None, _semi=None):
         d = {"type": "schedule_clause", "op": str(op), "from": start}
         if isinstance(end, dict):
             d.update(end)
@@ -352,3 +362,123 @@ class HasslTransformer(Transformer):
 
     def rule_clause(self, item):
         return item
+
+    # ======================
+    # NEW: Windows & Periods
+    # ======================
+    # schedule_new_clause:
+    #   period? "on" day_selector time_range holiday_mod? ";"
+    # | "on" "holidays" CNAME time_range ";"
+    def schedule_new_clause(self, *parts):
+        # Two shapes:
+        # 1) [PeriodSelector]? , str(day), ("time", start, end), [("holiday_mod","except", id)] , ";"
+        # 2) "on" "holidays" id, ("time", start, end), ";"
+        psel = None
+        day = None
+        start = None
+        end = None
+        holiday_mode = None
+        holiday_ref = None
+        # Normalize tokens out; ignore trailing semicolon if present
+        for p in parts:
+            if p is None: 
+                continue
+            if isinstance(p, nodes.PeriodSelector):
+                psel = p
+            elif isinstance(p, tuple) and p and p[0] == "time":
+                start, end = p[1], p[2]
+            elif isinstance(p, tuple) and p and p[0] == "holiday_mod":
+                holiday_mode, holiday_ref = p[1], p[2]
+            elif isinstance(p, str):
+                # could be day_selector OR the "holidays" variant path
+                if p in ("weekdays", "weekends", "daily"):
+                    day = p
+                elif p == "holidays":
+                    # handled in sched_holiday_only (see below) via grammar alt; keep safe here
+                    pass
+        if day is None and holiday_ref is not None and holiday_mode == "only":
+            # holiday-only case routed here (fallback); but grammar provides a dedicated alt below
+            day = "daily"
+        if day is None:
+            # If grammar routed the holiday-only alt here improperly, bail loud
+            raise ValueError("schedule_new_clause: missing day_selector")
+        return nodes.ScheduleWindow(
+            start=str(start), end=str(end),
+            day_selector=day, period=psel,
+            holiday_ref=holiday_ref, holiday_mode=holiday_mode
+        )
+
+    # Dedicated handler if your parser surfaces the holiday-only branch separately:
+    def sched_holiday_only(self, _on_kw, _hol_kw, ident, tr, _semi=None):
+        # tr is ("time", start, end)
+        return nodes.ScheduleWindow(
+            start=str(tr[1]), end=str(tr[2]),
+            day_selector="daily",
+            period=None,
+            holiday_ref=str(ident),
+            holiday_mode="only"
+        )
+
+    def period(self, p):
+        return p
+
+    # month_range: MONTH (".." MONTH)? ("," MONTH)*
+    def month_range(self, *parts):
+        items = [str(x) for x in parts if not (isinstance(x, Token) and str(x) == "..")]
+        dots = any(isinstance(x, Token) and str(x) == ".." for x in parts)
+        if dots:
+            if len(items) < 2:
+                raise ValueError("month_range: expected A .. B")
+            return nodes.PeriodSelector(kind="months", data={"range": [items[0], items[1]]})
+        return nodes.PeriodSelector(kind="months", data={"list": items})
+
+    def mmdd_range(self, a, _dots, b):
+        return nodes.PeriodSelector(kind="dates", data={"start": str(a), "end": str(b)})
+
+    def ymd_range(self, a, _dots, b):
+        return nodes.PeriodSelector(kind="range", data={"start": str(a), "end": str(b)})
+
+    def day_selector(self, tok):
+        return str(tok)
+
+    def time_range(self, a, _dash, b):
+        return ("time", str(a), str(b))
+
+    def holiday_mod(self, _except, _hol, ident):
+        return ("holiday_mod", "except", str(ident))
+
+    # Tokens
+    def MONTH(self, t): return str(t)
+    def MMDD(self, t): return str(t)
+    def YMD(self, t):  return str(t)
+
+    # =====================
+    # NEW: Holidays decl(s)
+    # =====================
+    # holidays_decl: "holidays" CNAME ":" holi_kv ("," holi_kv)*
+    def holidays_decl(self, _kw, ident, _colon=None, *kvs):
+        params = {"country": None, "province": None, "add": [], "remove": [],
+                  "workdays": None, "excludes": None}
+        for kv in kvs:
+            if isinstance(kv, tuple) and len(kv) == 2:
+                k, v = kv
+                params[k] = v
+        hs = nodes.HolidaySet(
+            id=str(ident),
+            country=(params["country"][1:-1] if isinstance(params["country"], str) and params["country"].startswith('"') else params["country"]),
+            province=(params["province"][1:-1] if isinstance(params["province"], str) and params["province"] and params["province"].startswith('"') else params["province"]),
+            add=[s[1:-1] if isinstance(s, str) and s.startswith('"') else str(s) for s in (params["add"] or [])],
+            remove=[s[1:-1] if isinstance(s, str) and s.startswith('"') else str(s) for s in (params["remove"] or [])],
+            workdays=(params["workdays"] or ["mon","tue","wed","thu","fri"]),
+            excludes=(params["excludes"] or ["sat","sun","holiday"]),
+        )
+        self.stmts.append(hs)
+        return hs
+
+    # holi_kv: "country"="..." | "province"="..." | "workdays"="[" daylist "]" | "excludes"="[" excludelist "]" | "add"="[" datestr_list "]" | "remove"="[" datestr_list "]"
+    def holi_workdays(self, items): return ("workdays", items)
+    def holi_excludes(self, items): return ("excludes", items)
+    def daylist(self, *days): return [str(d) for d in days]
+    def excludelist(self, *xs): return [str(x) for x in xs]
+    def datestr_list(self, *xs): return [str(x) for x in xs]
+    def DATESTR(self, t): return str(t)
