@@ -1,4 +1,4 @@
-from typing import Dict, List, Iterable, Any, Tuple
+from typing import Dict, List, Iterable, Any, Tuple, Optional
 import os, re
 from dataclasses import dataclass, field
 from ..semantics.analyzer import IRProgram, IRSync
@@ -128,6 +128,114 @@ class ScheduleRegistry:
         self.period_cache[key] = entity_id
         return entity_id
 
+# ---------- NEW: window helpers (mirrors rules_min logic) ----------
+def _parse_offset(off: str) -> str:
+    if not off: return "00:00:00"
+    m = re.fullmatch(r"([+-])(\d+)(ms|s|m|h|d)", str(off).strip())
+    if not m: return "00:00:00"
+    sign, n, unit = m.group(1), int(m.group(2)), m.group(3)
+    seconds = {"ms": 0, "s": n, "m": n*60, "h": n*3600, "d": n*86400}[unit]
+    h = seconds // 3600
+    m_ = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
+
+def _clock_between_cond(hhmm_start: str, hhmm_end: str):
+    return {
+        "condition": "template",
+        "value_template": (
+            "{% set now_s = now().strftime('%H:%M') %}"
+            f"{{% set s = '{hhmm_start}' %}}{{% set e = '{hhmm_end}' %}}"
+            "{{ (s < e and (now_s >= s and now_s < e)) "
+            "or (s >= e and (now_s >= s or now_s < e)) }}"
+        )
+    }
+
+def _sun_edge_cond(edge: str, ts: dict):
+    event = ts.get("event", "sunrise")
+    off = _parse_offset(ts.get("offset", "0s"))
+    cond = {"condition": "sun", edge: event}
+    if off and off != "00:00:00":
+        cond["offset"] = off
+    return cond
+
+def _window_condition_from_specs(start_ts, end_ts):
+    # clock → clock
+    if isinstance(start_ts, dict) and start_ts.get("kind") == "clock" and \
+       isinstance(end_ts, dict) and end_ts.get("kind") == "clock":
+        s = start_ts.get("value", "00:00")
+        e = end_ts.get("value", "00:00")
+        return _clock_between_cond(s, e)
+    # sun → sun
+    if isinstance(start_ts, dict) and start_ts.get("kind") == "sun" and \
+       isinstance(end_ts, dict) and end_ts.get("kind") == "sun":
+        after_start = _sun_edge_cond("after", start_ts)
+        before_end  = _sun_edge_cond("before", end_ts)
+        wrap = (start_ts.get("event") == "sunset" and end_ts.get("event") == "sunrise")
+        if wrap:
+            return {"condition": "or", "conditions": [after_start, before_end]}
+        return {"condition": "and", "conditions": [after_start, before_end]}
+    # mixed → minute-of-day template
+    return {
+        "condition": "template",
+        "value_template": (
+            "{% set now_m = now().hour*60 + now().minute %}"
+            "{% macro tod(hhmm) %}{% set h=hhmm[0:2]|int %}{% set m=hhmm[3:5]|int %}{{ h*60+m }}{% endmacro %}"
+            "{% set s_m = ("
+            "{% if start.kind == 'clock' %}"
+            "  tod(start.value)"
+            "{% else %}"
+            "  (as_local(state_attr('sun.sun', 'next_' + start.event)).hour*60 + "
+            "   as_local(state_attr('sun.sun', 'next_' + start.event)).minute) "
+            "{% endif %}"
+            ") %}"
+            "{% set e_m = ("
+            "{% if end.kind == 'clock' %}"
+            "  tod(end.value)"
+            "{% else %}"
+            "  (as_local(state_attr('sun.sun', 'next_' + end.event)).hour*60  "
+            "   as_local(state_attr('sun.sun', 'next_' + end.event)).minute) "
+            "{% endif %}"
+            ") %}"
+            "{{ (s_m < e_m and (now_m >= s_m and now_m < e_m)) "
+            "or (s_m >= e_m and (now_m >= s_m or now_m < e_m)) }}"
+        ),
+        "variables": {"start": start_ts or {}, "end": end_ts or {}}
+    }
+
+def _day_selector_condition(sel: Optional[str]):
+    if sel == "weekdays":
+        return {"condition": "time", "weekday": ["mon","tue","wed","thu","fri"]}
+    if sel == "weekends":
+        return {"condition": "time", "weekday": ["sat","sun"]}
+    # daily / None
+    return {"condition": "template", "value_template": "true"}
+
+def _holiday_condition(mode: Optional[str], hol_id: Optional[str]):
+    if not (mode and hol_id):
+        return {"condition": "template", "value_template": "true"}
+    # True when today is a holiday for 'only', false when 'except'
+    eid = f"binary_sensor.hassl_holiday_{hol_id}"
+    return {"condition": "state", "entity_id": eid, "state": "on" if mode == "only" else "off"}
+    
+def _trigger_for(ts: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a HA trigger for a time-spec dict:
+      - {"kind":"clock","value":"HH:MM"}  -> time at HH:MM:00
+      - {"kind":"sun","event":"sunrise|sunset","offset":"+15m"} -> sun trigger (with offset)
+    """
+    if isinstance(ts, dict) and ts.get("kind") == "clock":
+        hhmm = ts.get("value", "00:00")
+        at = hhmm if len(hhmm) == 8 else (hhmm + ":00" if len(hhmm) == 5 else "00:00:00")
+        return {"platform": "time", "at": at}
+    if isinstance(ts, dict) and ts.get("kind") == "sun":
+        trig = {"platform": "sun", "event": ts.get("event", "sunrise")}
+        off = _parse_offset(ts.get("offset", "0s"))
+        if off and off != "00:00:00":
+           trig["offset"] = off
+        return trig
+    # Fallback: evaluate soon; maintenance automation will correct state anyway
+    return {"platform": "time_pattern", "minutes": "/1"}
 
 def _jinja_offset(offset: str) -> str:
     """
@@ -369,8 +477,8 @@ def emit_package(ir: IRProgram, outdir: str):
     helpers: Dict = {"input_text": {}, "input_boolean": {}, "input_number": {}}
     scripts: Dict = {"script": {}}
     automations: List[Dict] = []
-    holiday_bs_defs: List[Dict] = [] #workday platform sensors
-    
+    holiday_bs_defs: List[Dict] = [] # workday platform sensors
+    holiday_tpl_defs: List[Dict] = [] # template sensors (true on holiday)
     # ---------- PASS 1: create named schedule helpers ONCE per (pkg, name) ----------
     for s in _collect_named_schedules(ir):
         if not s.get("name"):
@@ -393,7 +501,24 @@ def emit_package(ir: IRProgram, outdir: str):
             if h.get("add"): entry["add_holidays"] = list(h["add"])
             if h.get("remove"): entry["remove_holidays"] = list(h["remove"])
             holiday_bs_defs.append(entry)
-
+            # Derived template: ON when "today is a holiday" (not workday) + apply add/remove overrides
+            today = "now().date().strftime('%Y-%m-%d')"
+            add_list = list(h.get("add") or [])
+            rem_list = list(h.get("remove") or [])
+            # base: not workday => holiday/weekend; override adds/removes
+            # (If you want holidays excluding weekends, adjust the base accordingly.)
+            eid_name = f"hassl_holiday_{hid}"
+            expr = (
+                f"( not is_state('binary_sensor.hassl_{hid}_workday','on') ) "
+                f"or ({today} in {add_list})"
+            )
+            if rem_list:
+                expr = f"( {expr} ) and not ({today} in {rem_list})"
+            holiday_tpl_defs.append({
+                "name": eid_name,
+                "unique_id": eid_name,
+                "state": "{{ " + expr + " }}"
+            })
 
     # ---------- Context helpers for entities & per-prop contexts ----------
     sync_entities = set(); entity_props = {}
@@ -641,62 +766,98 @@ def emit_package(ir: IRProgram, outdir: str):
                     })
                 automations.append({"alias": f"HASSL sync {s.name} downstream {prop}","mode":"queued","max":10,"trigger": trigger,"action": actions})
 
-    # ---------- New schedule windows (emit input_boolean + on/off automations) ----------
+    # ---------- New schedule windows (emit input_boolean + minute/sun maintenance automation) ----------
     # IR provides schedules_windows: { name: [ {start,end,day_selector,period,holiday_*} ] }
     sched_windows_ir = getattr(ir, "schedules_windows", {}) or {}
     per_schedule_automations: Dict[str, List[Dict]] = {}
     for sched_name, wins in sched_windows_ir.items():
-        # Ensure schedule boolean exists in helpers
-        helpers["input_boolean"][f"hassl_sched_{_safe(sched_name)}"] = {
-            "name": f"HASSL Schedule {sched_name}"
+        # Ensure schedule boolean exists in helpers (include pkg prefix!)
+        sched_bool_key = f"hassl_sched_{_safe(pkg)}_{_safe(sched_name)}"
+        helpers["input_boolean"][sched_bool_key] = {
+            "name": f"HASSL Schedule {pkg}.{sched_name}"
         }
-        bool_eid = f"input_boolean.hassl_sched_{_safe(sched_name)}"
+        bool_eid = f"input_boolean.{sched_bool_key}"
+
+        # Build OR-of-windows condition bundles
+        or_conditions: List[Dict[str, Any]] = []
+        need_sun_triggers = False
 
         for idx, w in enumerate(wins):
-            start = w["start"] + (":00" if len(w["start"])==5 else "")
-            end   = w["end"]   + (":00" if len(w["end"])==5 else "")
-
-            # Build conditions
-            conds: List[Dict[str, Any]] = []
             ds = w.get("day_selector")
-            if ds == "weekdays":
-                conds.append({"condition": "time", "weekday": ["mon","tue","wed","thu","fri"]})
-            elif ds == "weekends":
-                conds.append({"condition": "time", "weekday": ["sat","sun"]})
-            # holidays
-            href = w.get("holiday_ref"); hmode = w.get("holiday_mode")
-            if href and hmode in ("except","only"):
-                # workday sensor: on => workday (not holiday); off => holiday/weekend
-                conds.append({
-                    "condition": "state",
-                    "entity_id": f"binary_sensor.hassl_{href}_workday",
-                    "state": "on" if hmode == "except" else "off"
-                })
-            # period
+            href = w.get("holiday_ref")
+            hmode = w.get("holiday_mode")
             period = w.get("period")
 
+            # time window condition
+            start = w.get("start"); end = w.get("end")
+            # start/end can be dicts if sun/clock; pass through
+            window_cond = _window_condition_from_specs(start, end) if (start and end) else {"condition":"template","value_template":"true"}
+            if isinstance(start, dict) and start.get("kind") == "sun": need_sun_triggers = True
+            if isinstance(end, dict) and end.get("kind") == "sun": need_sun_triggers = True
+
+            # day selector & holiday & period
+            conds_and = [ _day_selector_condition(ds), _holiday_condition(hmode, href), window_cond ]
             period_eid = sched_reg.ensure_period_sensor(sched_name, period)
             if period_eid:
-                conds.append({"condition":"state", "entity_id": period_eid, "state":"on"})
+                conds_and.append({"condition":"state", "entity_id": period_eid, "state":"on"})
 
-            def add_auto(suffix: str, at_time: str, turn_on: bool):
-                per_schedule_automations.setdefault(sched_name, []).append({
-                    "alias": f"HASSL schedule {sched_name} {suffix}",
-                    "mode": "single",
-                    "trigger": [{"platform":"time","at": at_time}],
-                    "condition": conds,
-                    "action": [{
-                        "service": "input_boolean.turn_on" if turn_on else "input_boolean.turn_off",
-                        "target": {"entity_id": bool_eid}
-                    }]
-                })
+            or_conditions.append({ "condition": "and", "conditions": conds_and })
 
-            # If window crosses midnight (start > end), we still generate simple time-based on/off.
+            
+            # --- Per-window explicit ON/OFF automations (satisfy test) ---
+            # Build base AND conditions without the window condition (the trigger moment defines edge),
+            # but keeping day/holiday/period guards.
+            edge_conds = [ _day_selector_condition(ds), _holiday_condition(hmode, href) ]
+            if period_eid:
+                edge_conds.append({"condition":"state", "entity_id": period_eid, "state":"on"})
 
+            # ON at start edge
+            per_schedule_automations.setdefault(sched_name, []).append({
+                "alias": f"HASSL schedule {pkg}.{sched_name} on_{idx}",
+                "mode": "single",
+              "trigger": [ _trigger_for(start) ] if start else [{"platform":"time_pattern","minutes":"/1"}],
+                "condition": edge_conds,
+                "action": [ { "service": "input_boolean.turn_on", "target": {"entity_id": bool_eid} } ]
+            })
+            # OFF at end edge
+            per_schedule_automations.setdefault(sched_name, []).append({
+                "alias": f"HASSL schedule {pkg}.{sched_name} off_{idx}",
+                "mode": "single",
+                "trigger": [ _trigger_for(end) ] if end else [{"platform":"time_pattern","minutes":"/1"}],
+                "condition": edge_conds,
+                "action": [ { "service": "input_boolean.turn_off", "target": {"entity_id": bool_eid} } ]
+            })
+            
+        # Composite choose: ON when any window matches, else OFF
+        choose_block = [{
+            "conditions": [{ "condition": "or", "conditions": or_conditions }] if or_conditions else [{"condition":"template","value_template":"false"}],
+            "sequence": [{"service": "input_boolean.turn_on", "target": {"entity_id": bool_eid}}]
+        }]
+        
 
-            # HA will run the 'end' next morning; no extra split needed because conditions gate by day/period/holiday.
-            add_auto(f"on_{idx}", start, True)
-            add_auto(f"off_{idx}", end, False)
+        triggers = [
+            {"platform": "time_pattern", "minutes": "/1"},
+            # Re-evaluate on HA restart so the boolean is correct immediately
+            {"platform": "homeassistant", "event": "start"},
+        ]
+        if need_sun_triggers:
+            # Nudge immedately at edges so the boolean flips promptly
+            triggers.extend([
+                {"platform": "sun", "event": "sunrise"},
+                {"platform": "sun", "event": "sunset"}
+            ])
+
+        per_schedule_automations.setdefault(sched_name, []).append({
+            "alias": f"HASSL schedule {pkg}.{sched_name} maint",
+            "mode": "single",
+            "trigger": triggers,
+            "condition": [],
+            "action": [
+                {"choose": choose_block,
+                 "default": [{"service": "input_boolean.turn_off", "target": {"entity_id": bool_eid}}]
+                }
+            ]
+        })
 
     # ---------- Write YAML ----------
     # helpers & scripts
@@ -710,13 +871,15 @@ def emit_package(ir: IRProgram, outdir: str):
             {"template": [{"binary_sensor": sched_reg.sensors}]}
         )
 
-    # holidays workday sensors
-    if holiday_bs_defs:
-        _dump_yaml(
-            os.path.join(outdir, f"holidays_{pkg}.yaml"),
-            {"binary_sensor": holiday_bs_defs}
-        )
-        
+    # Holidays file: emit both sections together to avoid relying on append semantics
+    if holiday_bs_defs or holiday_tpl_defs:
+        hol_doc: Dict[str, Any] = {}
+        if holiday_bs_defs:
+            hol_doc["binary_sensor"] = holiday_bs_defs
+        if holiday_tpl_defs:
+            hol_doc["template"] = [{"binary_sensor": holiday_tpl_defs}]
+        _dump_yaml(os.path.join(outdir, f"holidays_{pkg}.yaml"), hol_doc)
+
     # automations per sync
     for s in ir.syncs:
         doc = [a for a in automations if a["alias"].startswith(f"HASSL sync {s.name}")]
