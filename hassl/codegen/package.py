@@ -140,15 +140,27 @@ def _parse_offset(off: str) -> str:
     s = seconds % 60
     return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
 
+def _wrap_tpl(expr: str) -> str:
+    """Ensure a Jinja expression is wrapped safely in {{ … }}."""
+    expr = expr.strip()
+    if expr.startswith("{{") and expr.endswith("}}"):
+        return expr
+    return "{{ " + expr + " }}"
+
 def _clock_between_cond(hhmm_start: str, hhmm_end: str):
+    # Pure expression (no {% %} / inner {{ }}), safe to embed in {{ ... }}
+    ns = "now().strftime('%H:%M')"
+    s  = hhmm_start
+    e  = hhmm_end
+
+    expr = (
+        f"( ('{s}' < '{e}' and ({ns} >= '{s}' and {ns} < '{e}')) "
+        f"or ('{s}' >= '{e}' and ({ns} >= '{s}' or {ns} < '{e}')) )"
+    )
+    
     return {
         "condition": "template",
-        "value_template": (
-            "{% set now_s = now().strftime('%H:%M') %}"
-            f"{{% set s = '{hhmm_start}' %}}{{% set e = '{hhmm_end}' %}}"
-            "{{ (s < e and (now_s >= s and now_s < e)) "
-            "or (s >= e and (now_s >= s or now_s < e)) }}"
-        )
+        "value_template": _wrap_tpl(expr)
     }
 
 def _sun_edge_cond(edge: str, ts: dict):
@@ -175,33 +187,19 @@ def _window_condition_from_specs(start_ts, end_ts):
         if wrap:
             return {"condition": "or", "conditions": [after_start, before_end]}
         return {"condition": "and", "conditions": [after_start, before_end]}
-    # mixed → minute-of-day template
+    # mixed → minute-of-day template (pure expression, no {% %})
+    NOWM = "(now().hour*60 + now().minute)"
+    SM = "(((start.value[0:2]|int)*60 + (start.value[3:5]|int)) if start.kind == 'clock' else (as_local(state_attr('sun.sun','next_' ~ start.event)).hour*60 + as_local(state_attr('sun.sun','next_' ~ start.event)).minute))"
+    EM = "(((end.value[0:2]|int)*60 + (end.value[3:5]|int)) if end.kind == 'clock' else (as_local(state_attr('sun.sun','next_' ~ end.event)).hour*60 + as_local(state_attr('sun.sun','next_' ~ end.event)).minute))"
     return {
         "condition": "template",
         "value_template": (
-            "{% set now_m = now().hour*60 + now().minute %}"
-            "{% macro tod(hhmm) %}{% set h=hhmm[0:2]|int %}{% set m=hhmm[3:5]|int %}{{ h*60+m }}{% endmacro %}"
-            "{% set s_m = ("
-            "{% if start.kind == 'clock' %}"
-            "  tod(start.value)"
-            "{% else %}"
-            "  (as_local(state_attr('sun.sun', 'next_' + start.event)).hour*60 + "
-            "   as_local(state_attr('sun.sun', 'next_' + start.event)).minute) "
-            "{% endif %}"
-            ") %}"
-            "{% set e_m = ("
-            "{% if end.kind == 'clock' %}"
-            "  tod(end.value)"
-            "{% else %}"
-            "  (as_local(state_attr('sun.sun', 'next_' + end.event)).hour*60  "
-            "   as_local(state_attr('sun.sun', 'next_' + end.event)).minute) "
-            "{% endif %}"
-            ") %}"
-            "{{ (s_m < e_m and (now_m >= s_m and now_m < e_m)) "
-            "or (s_m >= e_m and (now_m >= s_m or now_m < e_m)) }}"
+            f"( ({SM} < {EM} and ({NOWM} >= {SM} and {NOWM} < {EM})) "
+            f"or ({SM} >= {EM} and ({NOWM} >= {SM} or {NOWM} < {EM})) )"
         ),
         "variables": {"start": start_ts or {}, "end": end_ts or {}}
     }
+    
 
 def _day_selector_condition(sel: Optional[str]):
     if sel == "weekdays":
@@ -209,11 +207,11 @@ def _day_selector_condition(sel: Optional[str]):
     if sel == "weekends":
         return {"condition": "time", "weekday": ["sat","sun"]}
     # daily / None
-    return {"condition": "template", "value_template": "true"}
+    return None
 
 def _holiday_condition(mode: Optional[str], hol_id: Optional[str]):
     if not (mode and hol_id):
-        return {"condition": "template", "value_template": "true"}
+        return None
     # True when today is a holiday for 'only', false when 'except'
     eid = f"binary_sensor.hassl_holiday_{hol_id}"
     return {"condition": "state", "entity_id": eid, "state": "on" if mode == "only" else "off"}
@@ -227,7 +225,7 @@ def _trigger_for(ts: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(ts, dict) and ts.get("kind") == "clock":
         hhmm = ts.get("value", "00:00")
         at = hhmm if len(hhmm) == 8 else (hhmm + ":00" if len(hhmm) == 5 else "00:00:00")
-        return {"platform": "time", "at": at}
+        return {"platform": "time", "at": str(at)}
     if isinstance(ts, dict) and ts.get("kind") == "sun":
         trig = {"platform": "sun", "event": ts.get("event", "sunrise")}
         off = _parse_offset(ts.get("offset", "0s"))
@@ -477,47 +475,32 @@ def emit_package(ir: IRProgram, outdir: str):
     helpers: Dict = {"input_text": {}, "input_boolean": {}, "input_number": {}}
     scripts: Dict = {"script": {}}
     automations: List[Dict] = []
-    holiday_bs_defs: List[Dict] = [] # workday platform sensors
-    holiday_tpl_defs: List[Dict] = [] # template sensors (true on holiday)
+
+    # We no longer emit legacy YAML 'platform: workday' sections.
+    # Only emit template sensors that reference UI-defined Workday entities.
+    holiday_tpl_defs: List[Dict] = []
+    
     # ---------- PASS 1: create named schedule helpers ONCE per (pkg, name) ----------
     for s in _collect_named_schedules(ir):
         if not s.get("name"):
             continue
         sched_reg.register_decl(s["name"], s.get("clauses", []))
 
-    # ---------- PASS 1b: Holidays -> Workday sensors ----------
-    # ir.holidays is {"id": {country, province, add, remove, workdays, excludes}}
+    # ---------- PASS 1b: Holidays -> (template only; Workday via UI) ----------
+    # ir.holidays is {"id": {...}}; we only need the id to reference UI entities.
     holidays_ir = getattr(ir, "holidays", {}) or {}
     if holidays_ir:
         for hid, h in holidays_ir.items():
-            entry = {
-                "platform": "workday",
-                "name": f"hassl_{hid}_workday",
-                "country": h.get("country") or "US",
-            }
-            if h.get("province"): entry["province"] = h["province"]
-            if h.get("workdays"): entry["workdays"] = list(h["workdays"])
-            if h.get("excludes"): entry["excludes"] = list(h["excludes"])
-            if h.get("add"): entry["add_holidays"] = list(h["add"])
-            if h.get("remove"): entry["remove_holidays"] = list(h["remove"])
-            holiday_bs_defs.append(entry)
-            # Derived template: ON when "today is a holiday" (not workday) + apply add/remove overrides
-            today = "now().date().strftime('%Y-%m-%d')"
-            add_list = list(h.get("add") or [])
-            rem_list = list(h.get("remove") or [])
-            # base: not workday => holiday/weekend; override adds/removes
-            # (If you want holidays excluding weekends, adjust the base accordingly.)
+            # Template: holiday = NOT(not_holiday)
+            # Assumes you configured a UI Workday instance that:
+            #   - has workdays = Mon..Sun
+            #   - excludes = ['holiday']
+            # and renamed it to: binary_sensor.hassl_<id>_not_holiday
             eid_name = f"hassl_holiday_{hid}"
-            expr = (
-                f"( not is_state('binary_sensor.hassl_{hid}_workday','on') ) "
-                f"or ({today} in {add_list})"
-            )
-            if rem_list:
-                expr = f"( {expr} ) and not ({today} in {rem_list})"
             holiday_tpl_defs.append({
                 "name": eid_name,
                 "unique_id": eid_name,
-                "state": "{{ " + expr + " }}"
+                "state": "{{ is_state('binary_sensor.hassl_" + hid + "_not_holiday', 'off') }}"
             })
 
     # ---------- Context helpers for entities & per-prop contexts ----------
@@ -778,55 +761,90 @@ def emit_package(ir: IRProgram, outdir: str):
         }
         bool_eid = f"input_boolean.{sched_bool_key}"
 
+        # --- Back-compat: emit '_active' template mirrors that follow the input_boolean ---
+        # 1) Primary mirror: binary_sensor.hassl_schedule_<pkg>_<name>_active
+        pkg_safe = _safe(pkg)
+        mirror_name = f"hassl_schedule_{pkg_safe}_{_safe(sched_name)}_active"
+        sched_reg.sensors.append({
+            "name": mirror_name,
+            "unique_id": mirror_name,
+            "state": "{{ is_state('" + bool_eid + "', 'on') }}"
+        })
+        # 2) Legacy alias (no pkg): binary_sensor.hassl_schedule_automations_<name>_active
+        # Some existing rulegen referenced this older name; keep it as a thin mirror.
+        legacy_alias = f"hassl_schedule_automations_{_safe(sched_name)}_active"
+        sched_reg.sensors.append({
+            "name": legacy_alias,
+            "unique_id": legacy_alias,
+            "state": "{{ is_state('" + bool_eid + "', 'on') }}"
+        })
+
         # Build OR-of-windows condition bundles
         or_conditions: List[Dict[str, Any]] = []
         need_sun_triggers = False
 
         for idx, w in enumerate(wins):
+
             ds = w.get("day_selector")
             href = w.get("holiday_ref")
             hmode = w.get("holiday_mode")
             period = w.get("period")
 
-            # time window condition
-            start = w.get("start"); end = w.get("end")
-            # start/end can be dicts if sun/clock; pass through
-            window_cond = _window_condition_from_specs(start, end) if (start and end) else {"condition":"template","value_template":"true"}
-            if isinstance(start, dict) and start.get("kind") == "sun": need_sun_triggers = True
-            if isinstance(end, dict) and end.get("kind") == "sun": need_sun_triggers = True
+            # Coerce time specs to dicts compatible with _trigger_for/_window_condition_from_specs
+            raw_start = w.get("start")
+            raw_end   = w.get("end")
+            def _coerce(ts):
+                if isinstance(ts, dict):
+                    return ts
+                if isinstance(ts, str):
+                    # accept "HH:MM" or "HH:MM:SS"
+                    v = ts if len(ts) in (5,8) else "00:00"
+                    return {"kind":"clock","value": v[:5] if len(v)==5 else v[:8]}
+                return {"kind":"clock","value":"00:00"}
+            start_ts = _coerce(raw_start)
+            end_ts   = _coerce(raw_end)
+
+            # window condition (handles clock↔sun and wrap)
+            window_cond = _window_condition_from_specs(start_ts, end_ts)
+            if start_ts.get("kind") == "sun" or end_ts.get("kind") == "sun":
+                need_sun_triggers = True
 
             # day selector & holiday & period
-            conds_and = [ _day_selector_condition(ds), _holiday_condition(hmode, href), window_cond ]
+            conds_and = [ c for c in (_day_selector_condition(ds),
+                                      _holiday_condition(hmode, href),
+                                      window_cond)
+                          if c is not None ]
             period_eid = sched_reg.ensure_period_sensor(sched_name, period)
             if period_eid:
                 conds_and.append({"condition":"state", "entity_id": period_eid, "state":"on"})
-
             or_conditions.append({ "condition": "and", "conditions": conds_and })
 
-            
-            # --- Per-window explicit ON/OFF automations (satisfy test) ---
-            # Build base AND conditions without the window condition (the trigger moment defines edge),
-            # but keeping day/holiday/period guards.
+            # --- Per-window explicit ON/OFF automations (edges only) ---
             edge_conds = [ _day_selector_condition(ds), _holiday_condition(hmode, href) ]
             if period_eid:
-                edge_conds.append({"condition":"state", "entity_id": period_eid, "state":"on"})
+                edge_conds.append({"condition": "state", "entity_id": period_eid, "state": "on"})
+                edge_conds = [c for c in edge_conds if c]
 
-            # ON at start edge
-            per_schedule_automations.setdefault(sched_name, []).append({
+            on_auto = {
                 "alias": f"HASSL schedule {pkg}.{sched_name} on_{idx}",
                 "mode": "single",
-              "trigger": [ _trigger_for(start) ] if start else [{"platform":"time_pattern","minutes":"/1"}],
-                "condition": edge_conds,
+                "trigger": [ _trigger_for(start_ts) ],
                 "action": [ { "service": "input_boolean.turn_on", "target": {"entity_id": bool_eid} } ]
-            })
-            # OFF at end edge
-            per_schedule_automations.setdefault(sched_name, []).append({
+            }
+            ec = [c for c in edge_conds if c]
+            if ec:
+                on_auto["condition"] = ec
+            per_schedule_automations.setdefault(sched_name, []).append(on_auto)
+
+            off_auto = {
                 "alias": f"HASSL schedule {pkg}.{sched_name} off_{idx}",
                 "mode": "single",
-                "trigger": [ _trigger_for(end) ] if end else [{"platform":"time_pattern","minutes":"/1"}],
-                "condition": edge_conds,
+                "trigger": [ _trigger_for(end_ts) ],
                 "action": [ { "service": "input_boolean.turn_off", "target": {"entity_id": bool_eid} } ]
-            })
+            }
+            if ec:
+                off_auto["condition"] = ec
+            per_schedule_automations.setdefault(sched_name, []).append(off_auto)
             
         # Composite choose: ON when any window matches, else OFF
         choose_block = [{
@@ -871,13 +889,10 @@ def emit_package(ir: IRProgram, outdir: str):
             {"template": [{"binary_sensor": sched_reg.sensors}]}
         )
 
-    # Holidays file: emit both sections together to avoid relying on append semantics
-    if holiday_bs_defs or holiday_tpl_defs:
+    # Holidays file: emit only the template sensors; Workday instances are created via UI
+    if holiday_tpl_defs:
         hol_doc: Dict[str, Any] = {}
-        if holiday_bs_defs:
-            hol_doc["binary_sensor"] = holiday_bs_defs
-        if holiday_tpl_defs:
-            hol_doc["template"] = [{"binary_sensor": holiday_tpl_defs}]
+        hol_doc["template"] = [{"binary_sensor": holiday_tpl_defs}]
         _dump_yaml(os.path.join(outdir, f"holidays_{pkg}.yaml"), hol_doc)
 
     # automations per sync

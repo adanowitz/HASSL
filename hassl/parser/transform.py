@@ -311,27 +311,53 @@ class HasslTransformer(Transformer):
         return sched
     
     # rule_schedule_use: SCHEDULE USE name_list ";"
-    def rule_schedule_use(self, _sched_kw, _use_kw, names, _semi=None):
+    def rule_schedule_use(self, *args):
+        # Accept both strict and loose forms: (SCHEDULE, USE, name_list, ';') or just (name_list)
+        names = None
+        for a in args:
+            if isinstance(a, list):
+                names = a
+        if names is None:
+            names = [str(a) for a in args if isinstance(a, (str, Token))]
         norm = [n if isinstance(n, str) else str(n) for n in names]
         return {"type": "schedule_use", "names": norm}
 
     # rule_schedule_inline: SCHEDULE schedule_clause+
-    def rule_schedule_inline(self, _sched_kw, *clauses):
-        clist = [c for c in clauses if isinstance(c, dict) and c.get("type") == "schedule_clause"]
-        return {"type": "schedule_inline", "clauses": clist}
+    def rule_schedule_inline(self, *parts):
+        # Parts may include the literal 'schedule' token; filter and keep only clause dicts.
+        clauses = [p for p in parts if isinstance(p, dict) and p.get("type") == "schedule_clause"]
+        return {"type": "schedule_inline", "clauses": clauses}
 
     # schedule_clause is now an alternation:
     #   schedule_clause: schedule_legacy_clause | schedule_new_clause
     # Lark passes the single child. Just forward it.
-    def schedule_clause(self, item):
+    def schedule_clause(self, item=None, *rest):
+        # Lark may inline/flatten; take the first dict-ish child.
+        if isinstance(item, dict):
+            return item
+        for r in rest:
+            if isinstance(r, dict):
+                return r
         return item
 
     # Legacy shape stays the same; build the dict here.
     # schedule_legacy_clause: schedule_op FROM time_spec schedule_end? ";"
-    def schedule_legacy_clause(self, op, _from_kw, start, end=None, _semi=None):
-        d = {"type": "schedule_clause", "op": str(op), "from": start}
-        if isinstance(end, dict):
-            d.update(end)
+    def schedule_legacy_clause(self, *args):
+        # Expect: op, 'from', start, [end], [';']
+        op = "enable"; start = None; end = None
+        for a in args:
+            if isinstance(a, Token) and a.type in ("ENABLE","DISABLE"):
+                op = str(a).lower()
+            elif isinstance(a, dict) and a.get("kind") in ("clock","sun"):
+                if start is None: start = a
+                else: end = a if isinstance(a, dict) else end
+            elif isinstance(a, dict) and ("to" in a or "until" in a):
+                # already normalized end-shape
+                end = a.get("to") or a.get("until")
+        d = {"type": "schedule_clause", "op": op, "from": start}
+        if end is not None:
+            # keep legacy downstream compatibility
+            d.update({"to": end})
         return d
 
     def schedule_op(self, tok):
@@ -370,57 +396,141 @@ class HasslTransformer(Transformer):
     #   period? "on" day_selector time_range holiday_mod? ";"
     # | "on" "holidays" CNAME time_range ";"
     def schedule_new_clause(self, *parts):
-        # Two shapes:
-        # 1) [PeriodSelector]? , str(day), ("time", start, end), [("holiday_mod","except", id)] , ";"
-        # 2) "on" "holidays" id, ("time", start, end), ";"
+        """
+            Tolerant handler for:
+            period? on (weekdays|weekends|daily) HH:MM-HH:MM [except holidays ID] ;
+            on holidays ID HH:MM-HH:MM ;
+            Accepts either ("time", start, end) or {"start","end"} from time_range().
+        """
+        from lark import Token
+
         psel = None
         day = None
         start = None
         end = None
         holiday_mode = None
         holiday_ref = None
-        # Normalize tokens out; ignore trailing semicolon if present
+
+        prev_holidays = False   # just saw the literal 'holidays'
+        prev_except = False     # just saw the literal 'except'
+
         for p in parts:
-            if p is None: 
+            if p is None:
                 continue
+
+            # period selector node
             if isinstance(p, nodes.PeriodSelector):
                 psel = p
-            elif isinstance(p, tuple) and p and p[0] == "time":
+                prev_holidays = False
+                prev_except = False
+                continue
+
+            # time range
+            if isinstance(p, tuple) and p and p[0] == "time":
                 start, end = p[1], p[2]
-            elif isinstance(p, tuple) and p and p[0] == "holiday_mod":
+                prev_holidays = False
+                prev_except = False
+                continue
+            if isinstance(p, dict) and "start" in p and "end" in p:
+                start, end = p["start"], p["end"]
+                prev_holidays = False
+                prev_except = False
+                continue
+
+            # holiday modifier from holiday_mod()
+            if isinstance(p, tuple) and p and p[0] == "holiday_mod":
                 holiday_mode, holiday_ref = p[1], p[2]
-            elif isinstance(p, str):
-                # could be day_selector OR the "holidays" variant path
-                if p in ("weekdays", "weekends", "daily"):
-                    day = p
-                elif p == "holidays":
-                    # handled in sched_holiday_only (see below) via grammar alt; keep safe here
-                    pass
-        if day is None and holiday_ref is not None and holiday_mode == "only":
-            # holiday-only case routed here (fallback); but grammar provides a dedicated alt below
-            day = "daily"
+                prev_holidays = False
+                prev_except = False
+                continue
+
+            # tokens / strings
+            if isinstance(p, Token):
+                sval = str(p).lower()
+                if sval == "except":
+                    prev_except = True
+                    prev_holidays = False
+                    continue
+                if sval == "holidays":
+                    prev_holidays = True
+                    continue
+                if sval in ("weekdays", "weekends", "daily"):
+                    day = sval
+                    prev_holidays = False
+                    prev_except = False
+                    continue
+                if p.type == "CNAME" and prev_holidays and holiday_ref is None:
+                    holiday_ref = str(p)
+                    holiday_mode = holiday_mode or ("except" if prev_except else "only")
+                    prev_holidays = False
+                    prev_except = False
+                    continue
+
+            if isinstance(p, str):
+                sval = p.lower()
+                if sval == "except":
+                    prev_except = True
+                    prev_holidays = False
+                    continue
+                if sval == "holidays":
+                    prev_holidays = True
+                    continue
+                if sval in ("weekdays", "weekends", "daily"):
+                    day = sval
+                    prev_holidays = False
+                    prev_except = False
+                    continue
+                if prev_holidays and holiday_ref is None and sval not in ("on", "holidays", ";", ":"):
+                    holiday_ref = p
+                    holiday_mode = holiday_mode or ("except" if prev_except else "only")
+                    prev_holidays = False
+                    prev_except = False
+                    continue
+
+            # anything else cancels the lookbehinds
+            prev_holidays = False
+            prev_except = False
+
+        # default day when omitted (holiday-only branch or defensive)
         if day is None:
-            # If grammar routed the holiday-only alt here improperly, bail loud
-            raise ValueError("schedule_new_clause: missing day_selector")
+            day = "daily"
+
         return nodes.ScheduleWindow(
-            start=str(start), end=str(end),
-            day_selector=day, period=psel,
-            holiday_ref=holiday_ref, holiday_mode=holiday_mode
+            start=str(start) if start is not None else "00:00",
+            end=str(end) if end is not None else "00:00",
+            day_selector=day,
+            period=psel,
+            holiday_ref=holiday_ref,
+            holiday_mode=holiday_mode
         )
 
     # Dedicated handler if your parser surfaces the holiday-only branch separately:
-    def sched_holiday_only(self, _on_kw, _hol_kw, ident, tr, _semi=None):
-        # tr is ("time", start, end)
+    def sched_holiday_only(self, *args):
+        # Accept: 'on','holidays', ident, time_range, [';']
+        ident = None; start=None; end=None
+        for a in args:
+            if isinstance(a, Token) and a.type == "CNAME":
+                ident = str(a)
+            elif isinstance(a, tuple) and a and a[0] == "time":
+                start, end = a[1], a[2]
+            elif isinstance(a, dict) and "start" in a and "end" in a:
+                start, end = a["start"], a["end"]
+            elif isinstance(a, str) and a not in ("on","holidays",";"):
+                ident = a
         return nodes.ScheduleWindow(
-            start=str(tr[1]), end=str(tr[2]),
+            start=str(start), end=str(end),
             day_selector="daily",
             period=None,
-            holiday_ref=str(ident),
+            holiday_ref=str(ident) if ident is not None else "",
             holiday_mode="only"
         )
 
-    def period(self, p):
-        return p
+    def period(self, *args):
+        # Transparent wrapper around PeriodSelector
+        for a in args:
+            if isinstance(a, nodes.PeriodSelector):
+                return a
+        return args[0] if args else None
 
     # month_range: MONTH (".." MONTH)? ("," MONTH)*
     def month_range(self, *parts):
@@ -432,20 +542,68 @@ class HasslTransformer(Transformer):
             return nodes.PeriodSelector(kind="months", data={"range": [items[0], items[1]]})
         return nodes.PeriodSelector(kind="months", data={"list": items})
 
-    def mmdd_range(self, a, _dots, b):
-        return nodes.PeriodSelector(kind="dates", data={"start": str(a), "end": str(b)})
+    def mmdd_range(self, *args):
+        vals = [str(a) for a in args if not (isinstance(a, Token) and str(a) == "..")]
+        a = vals[0] if vals else "01-01"
+        b = vals[1] if len(vals) > 1 else "01-01"
+        return nodes.PeriodSelector(kind="dates", data={"start": a, "end": b})
 
-    def ymd_range(self, a, _dots, b):
-        return nodes.PeriodSelector(kind="range", data={"start": str(a), "end": str(b)})
+    def ymd_range(self, *args):
+        vals = [str(a) for a in args if not (isinstance(a, Token) and str(a) == "..")]
+        a = vals[0] if vals else "1970-01-01"
+        b = vals[1] if len(vals) > 1 else "1970-01-01"
+        return nodes.PeriodSelector(kind="range", data={"start": a, "end": b})
 
-    def day_selector(self, tok):
+    def day_selector(self, *args):
+        # Accept either a single token (normal) or no children (defensive).
+        # When empty, default to "daily" so schedule_new_clause can still build.
+        if not args:
+            return "daily"
+        tok = args[0]
         return str(tok)
 
-    def time_range(self, a, _dash, b):
-        return ("time", str(a), str(b))
+    def time_range(self, *args):
+        from lark import Token
+        # strip literal '-' if present
+        parts = [a for a in args if not (isinstance(a, Token) and str(a) == "-")]
+        # Case 1: two TIME_HHMM tokens
+        times = [str(p) for p in parts if isinstance(p, Token) and p.type == "TIME_HHMM"]
+        if len(times) >= 2:
+            return ("time", times[0], times[1])
+        # Case 2: two plain strings
+        s_parts = [str(p) for p in parts if not isinstance(p, Token)]
+        if len(s_parts) >= 2 and ":" in s_parts[0] and ":" in s_parts[1]:
+            return ("time", s_parts[0], s_parts[1])
+        # Case 3: single "HH:MM-HH:MM"
+        if len(parts) == 1 and isinstance(parts[0], (str, Token)):
+            val = str(parts[0])
+            if "-" in val and ":" in val:
+                a, b = val.split("-", 1)
+                return ("time", a.strip(), b.strip())
+        # Fallback (shouldn't happen): return a harmless range
+        return ("time", "00:00", "00:00")
 
-    def holiday_mod(self, _except, _hol, ident):
-        return ("holiday_mod", "except", str(ident))
+    def holiday_mod(self, *args):
+        """
+        Accepts shapes like:
+          - 'except' 'holidays' CNAME
+          - 'on' 'holidays' CNAME  (treated as 'only')
+          - 'holidays' CNAME       (default to 'only')
+        Returns a tuple normalized for schedule_new_clause: ('holiday_mod', mode, ident)
+        """
+        mode = "only"
+        ident = None
+        for a in args:
+            s = str(a).lower()
+            if s == "except":
+                mode = "except"
+            elif s in ("on","only"):
+                mode = "only"
+            if isinstance(a, Token) and a.type == "CNAME":
+                ident = str(a)
+            elif isinstance(a, str) and s not in ("holidays","except","on","only",":",";"):
+                ident = str(a)
+        return ("holiday_mod", mode, ident or "")
 
     # Tokens
     def MONTH(self, t): return str(t)
@@ -456,28 +614,82 @@ class HasslTransformer(Transformer):
     # NEW: Holidays decl(s)
     # =====================
     # holidays_decl: "holidays" CNAME ":" holi_kv ("," holi_kv)*
-    def holidays_decl(self, _kw, ident, _colon=None, *kvs):
-        params = {"country": None, "province": None, "add": [], "remove": [],
-                  "workdays": None, "excludes": None}
-        for kv in kvs:
-            if isinstance(kv, tuple) and len(kv) == 2:
-                k, v = kv
-                params[k] = v
+    def holidays_decl(self, *children):
+        """
+        Accepts children like: 'holidays', CNAME, ':', (kv, ',', kv, ...).
+        Robustly extracts the first CNAME as the id and all ('key', value) tuples.
+        """
+        from lark import Token, Tree
+
+        ident = None
+        kvs = []
+
+        for ch in children:
+            # id
+            if ident is None:
+                if isinstance(ch, Token) and ch.type == "CNAME":
+                    ident = str(ch)
+                    continue
+                if isinstance(ch, str):  # just in case
+                    ident = ch
+                    continue
+            # kvs arrive as tuples from helper methods
+            if isinstance(ch, tuple) and len(ch) == 2 and isinstance(ch[0], str):
+                kvs.append(ch)
+
+        # defaults
+        params = {
+            "country": None,
+            "province": None,
+            "add": [],
+            "remove": [],
+            "workdays": None,
+            "excludes": None,
+        }
+
+        for k, v in kvs:
+            params[k] = v
+
+        # normalize quoted strings (country/province/add/remove can be quoted)
+        def unq(s):
+            if isinstance(s, str) and len(s) >= 2 and s[0] == s[-1] == '"':
+                return s[1:-1]
+            return s
+
+        country = unq(params["country"])
+        province = unq(params["province"])
+        add = [unq(s) for s in (params["add"] or [])]
+        remove = [unq(s) for s in (params["remove"] or [])]
+        workdays = params["workdays"] or ["mon", "tue", "wed", "thu", "fri"]
+        excludes = params["excludes"] or ["sat", "sun", "holiday"]
+
         hs = nodes.HolidaySet(
-            id=str(ident),
-            country=(params["country"][1:-1] if isinstance(params["country"], str) and params["country"].startswith('"') else params["country"]),
-            province=(params["province"][1:-1] if isinstance(params["province"], str) and params["province"] and params["province"].startswith('"') else params["province"]),
-            add=[s[1:-1] if isinstance(s, str) and s.startswith('"') else str(s) for s in (params["add"] or [])],
-            remove=[s[1:-1] if isinstance(s, str) and s.startswith('"') else str(s) for s in (params["remove"] or [])],
-            workdays=(params["workdays"] or ["mon","tue","wed","thu","fri"]),
-            excludes=(params["excludes"] or ["sat","sun","holiday"]),
+            id=str(ident) if ident is not None else "",
+            country=country,
+            province=province,
+            add=add,
+            remove=remove,
+            workdays=workdays,
+            excludes=excludes,
         )
         self.stmts.append(hs)
         return hs
 
-    # holi_kv: "country"="..." | "province"="..." | "workdays"="[" daylist "]" | "excludes"="[" excludelist "]" | "add"="[" datestr_list "]" | "remove"="[" datestr_list "]"
+    # --- Holidays KV helpers (return ('key', value)) ---
+
+    # country="US"
+    def holi_country(self, s): return ("country", str(s))
+    # province="CA"
+    def holi_province(self, s): return ("province", str(s))
+    # workdays=[ mon, tue, ... ]
     def holi_workdays(self, items): return ("workdays", items)
+    # excludes=[ sat, sun, holiday ]
     def holi_excludes(self, items): return ("excludes", items)
+    # add=["YYYY-MM-DD", ...]
+    def holi_add(self, items): return ("add", items)
+    # remove=["YYYY-MM-DD", ...]
+    def holi_remove(self, items): return ("remove", items)
+
     def daylist(self, *days): return [str(d) for d in days]
     def excludelist(self, *xs): return [str(x) for x in xs]
     def datestr_list(self, *xs): return [str(x) for x in xs]

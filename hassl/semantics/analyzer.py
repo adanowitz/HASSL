@@ -35,10 +35,10 @@ class IRProgram:
     rules: List[IRRule]
     # Legacy schedule clauses (enable/disable from …)
     schedules: Optional[Dict[str, List[dict]]] = None
-    # NEW: structured windows keyed by schedule name
-    schedules_windows: Dict[str, List[dict]] = field(default_factory=dict)
     # NEW: declared holiday sets (by id)
-    holidays: Dict[str, dict] = field(default_factory=dict)
+    holidays: Optional[Dict[str, dict]] = None
+    # NEW: structured windows keyed by schedule name
+    schedules_windows: Optional[Dict[str, List[dict]]] = None  # NEW
     
     def to_dict(self):
         return {
@@ -56,6 +56,8 @@ class IRProgram:
                 "schedule_gates": r.schedule_gates or [],
             } for r in self.rules],
             "schedules": self.schedules or {},
+            "holidays": self.holidays or {},
+            "schedules_windows": self.schedules_windows or {},  # NEW
         }
 
 def _resolve_alias(e: str, amap: Dict[str,str]) -> str:
@@ -127,9 +129,13 @@ def analyze(prog: Program) -> IRProgram:
                     # wrap in a lightweight Schedule node shape for export table parity
                     local_public[(package_name, "schedule", name)] = Schedule(name=name, clauses=s.get("clauses", []), private=False)
         elif isinstance(s, Schedule):
-            local_schedules.setdefault(s.name, []).extend(s.clauses or [])
+            # Only treat as "legacy" if there are actual legacy clauses.
+            if getattr(s, "clauses", None):
+                local_schedules.setdefault(s.name, []).extend(s.clauses or [])
+            # Always collect windows if present.
             if getattr(s, "windows", None):
                 local_schedule_windows.setdefault(s.name, []).extend(s.windows or [])
+            # Export the schedule either way (legacy or windows) if public.
             if not getattr(s, "private", False):
                 local_public[(package_name, "schedule", s.name)] = s
         elif isinstance(s, HolidaySet):
@@ -299,8 +305,8 @@ def analyze(prog: Program) -> IRProgram:
           source package, annotate as 'pkg.name' for consistency
         - qualified 'ns.x': resolve 'ns' to module and return 'module.x' if found
         """
-        # local schedule?
-        if nm in local_schedules:
+        # local schedule? (either legacy clauses OR window-only)
+        if nm in local_schedules or nm in local_schedule_windows:
             return f"{package_name+'.' if package_name else ''}{nm}"
         # imported by name (list or glob)
         if nm in imported_schedules:
