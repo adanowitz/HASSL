@@ -2,7 +2,7 @@
 
 > **Home Assistant Simple Scripting Language**
 
-![Version](https://img.shields.io/badge/version-v0.3.0-blue)
+![Version](https://img.shields.io/badge/version-v0.3.1-blue)
 
 HASSL is a human-friendly domain-specific language (DSL) for building **loop-safe**, **deterministic**, and **composable** automations for [Home Assistant](https://www.home-assistant.io/).
 
@@ -15,11 +15,12 @@ It compiles lightweight `.hassl` scripts into fully functional YAML packages tha
 - **Readable DSL** → write logic like natural language (`if motion && lux < 50 then light = on`)
 - **Sync devices** → keep switches, dimmers, and fans perfectly in sync
 - **Schedules** → declare time-based gates (`enable from 08:00 until 19:00`)
+- **Weekday/weekend/holiday schedules** → full support for Home Assistant’s **Workday integration** (v0.3.1)
 - **Loop-safe** → context ID tracking prevents feedback loops
 - **Per-rule enable gates** → `disable rule` or `enable rule` dynamically
 - **Inline waits** → `wait (!motion for 10m)` works like native HA triggers
 - **Color temperature in Kelvin** → `light.kelvin = 2700`
-- **Modular packages/imports** → split automations across files with public/private exports (v0.3.0)
+- **Modular packages/imports** → split automations across files with public/private exports
 - **Auto-reload resilience** → schedules re-evaluate automatically on HA restart
 
 ---
@@ -132,7 +133,7 @@ Each `.hassl` file compiles into an isolated package — no naming collisions, n
 | `scripts_<pkg>.yaml`       | Writer scripts with context stamping          |
 | `sync_<pkg>_*.yaml`        | Sync automations for each property            |
 | `rules_bundled_<pkg>.yaml` | Rule logic automations + schedules            |
-| `schedules_<pkg>.yaml`     | Time/sun-based schedule sensors (v0.3.0)      |
+| `schedules_<pkg>.yaml`     | Time/sun-based schedule sensors (v0.3.1)      |
 
 ---
 
@@ -165,10 +166,79 @@ All schedules are restart-safe:
 
 ---
 
+## 🗓️ Holiday & Workday Integration (v0.3.1)
+
+HASSL now supports `holidays <id>:` schedules tied to Home Assistant’s **Workday** integration.
+
+To enable holiday and weekday/weekend-aware schedules:
+
+### 1️⃣ Create two Workday sensors in Home Assistant
+
+You must create **two Workday integrations** through the Home Assistant UI.
+
+#### Sensor 1 — `binary_sensor.hassl_<id>_workday`
+- **Workdays:** Mon–Fri  
+- **Excludes:** `holiday`  
+- **Meaning:** ON only on real workdays (Mon–Fri that are not holidays).
+
+#### Sensor 2 — `binary_sensor.hassl_<id>_not_holiday`
+- **Workdays:** Mon–Sun  
+- **Excludes:** `holiday`  
+- **Meaning:** ON every day except official holidays (including weekends).
+
+> In both, set your **Country** and optional **Province/Region** as needed for your locale (e.g., `US`, `CA`, `GB`, etc.).  
+> After setup, rename the entity IDs to exactly match:
+> - `binary_sensor.hassl_<id>_workday`
+> - `binary_sensor.hassl_<id>_not_holiday`  
+> where `<id>` matches the identifier used in your `.hassl` file (e.g., `us_ca`).
+
+HASSL derives:
+- `binary_sensor.hassl_holiday_<id>` → ON on holidays (even when they fall on weekends).
+
+### Truth table
+
+| Day type                     | `hassl_<id>_workday` | `hassl_<id>_not_holiday` | `hassl_holiday_<id>` (derived) |
+|------------------------------|-----------------------|---------------------------|---------------------------------|
+| Tue (normal)                | on                    | on                        | off                             |
+| Sat (normal weekend)        | off                   | on                        | off                             |
+| Mon that’s an official holiday | off                 | off                       | on                              |
+| Sat that’s an official holiday | off                 | off                       | on                              |
+
+This distinction lets you build precise schedules like:
+```hassl
+holidays us_ca:
+    country="US", province="CA"
+
+schedule master_wake:
+  on weekdays 06:00–22:00 except holidays us_ca;
+  on weekends 08:00–22:00;
+  on holidays us_ca 09:00–22:00;
+```
+
+🧩 **Note:**  
+Both sensors must be created manually in the Home Assistant UI — integrations can’t be defined in YAML.  
+Once created, HASSL automatically references them in generated automations.
+
+---
+
+## ⚗️ Experimental: Date & Month Range Schedules
+
+HASSL v0.3.1 includes early support for:
+
+```hassl
+on months Jun–Aug 07:00–22:00;
+on dates 12-24..01-02 06:00–20:00;
+```
+
+These may compile successfully but are **not yet validated in production**.  
+They’re marked **experimental** and will be verified after template automation support (v0.4 milestone).
+
+---
+
 ## 📚 Documentation
 
-- [Quickstart Guide](./quickstart_v1.4_2025_v0.3.0.md)
-- [Language Specification](./hassl_language_spec_v1.4_2025_updated_v0.3.0.md)
+- [Quickstart Guide](./quickstart.md)
+- [Language Specification](./Hassl_spec.md)
 
 ---
 

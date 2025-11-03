@@ -1,12 +1,12 @@
 # HASSL Language Specification (v1.4 – 2025 Edition)
-_Updated for toolchain release **v0.3.0** (packages/imports, “private” visibility, schedule sensors, and semicolon rules)._
-
+_Updated for toolchain **v0.3.1** (imports/visibility; schedule sensors; safer Jinja; holiday/workday clarifications)._
+  
 This document describes the grammar, semantics, and runtime model for  
 **HASSL** — the *Home Assistant Simple Scripting Language.*
 
 ---
 
-## 📦 Modules & Visibility (NEW in v0.3.0)
+## 📦 Modules & Visibility (NEW in v0.3.x)
 
 HASSL sources live in **packages** and can **import** other packages.
 
@@ -39,7 +39,7 @@ schedule wake_hours:
 
 ## 📐 Grammar (EBNF)
 
-> Notes for v0.3.0:
+> Notes for v0.3.x:
 > - Added `package`, `import`, and `private`.
 > - Semicolons (`;`) are **required only** inside `then` action lists and in `schedule` clause lists.
 > - Top-level statements do **not** require trailing semicolons.
@@ -85,9 +85,9 @@ schedule_end   = "to" time_spec | "until" time_spec ;
 
 time_spec      = time_clock | time_sun | entity | ident ;
 time_clock     = time_hhmm ;
-time_hhmm      = /[0-2]?\d:[0-5]\d/ ;
+time_hhmm      = /[0-2]?\\d:[0-5]\\d/ ;
 time_sun       = ("sunrise" | "sunset") [ offset ] ;
-offset         = /[+-]\d+(ms|s|m|h|d)/ ;
+offset         = /[+-]\\d+(ms|s|m|h|d)/ ;
 
 # --- Expressions ---
 expression     = or_expr ;
@@ -126,7 +126,7 @@ state          = "on" | "off" ;
 duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
 ```
 
-### Semicolon Rules (v0.3.0)
+### Semicolon Rules (v0.3.x)
 - **Required** between actions in `then` blocks and between `schedule` clauses.
 - **Optional/unused** elsewhere (e.g., after `import` is allowed, but not required).
 
@@ -179,13 +179,16 @@ disable rule motion_light for 3m
 enable rule night_scene until sunrise+15m
 ```
 
-### 🕒 Schedules (v0.3.0 tooling behavior)
-#### Top-level Declarations
+---
+
+## 🕒 Schedules (v0.3.x tooling behavior)
+
+### Top-level Declarations
 ```hassl
 schedule wake_hours:
   enable from 07:00 to 23:00;
 ```
-**package.py** emits a **template binary_sensor** per named schedule:
+**Codegen** emits a **template binary_sensor** per named schedule:
 ```
 binary_sensor.hassl_schedule_<package>_<name>_active
 ```
@@ -194,16 +197,55 @@ binary_sensor.hassl_schedule_<package>_<name>_active
   - sun windows with offsets (e.g., `sunrise+15m`),
   - OR-of-ENABLE minus OR-of-DISABLE clauses.
 - Rules that `schedule use <name>;` add a `condition: state` on that sensor.
-- Importing packages **reuses** the declaring package’s sensor name; rules_min resolves the correct sensor by the schedule’s **base name** and the **declaring package**.
+- Importing packages **reuses** the declaring package’s sensor name; resolution is based on the schedule’s **base name** and the **declaring package**.
 
-#### Inline Rule Schedules
+### Inline Rule Schedules
 ```hassl
 rule porch:
   schedule
     enable from sunset until 23:00;
   if (motion) then light = on
 ```
-- No helpers created; rules_min compiles inline schedule clauses into HA `condition:` blocks (sun/clock/templated window checks).
+- No helpers created; inline schedule clauses compile directly into HA `condition:` blocks (sun/clock/templated window checks).
+
+---
+
+## 🗓️ Holidays, Weekdays & Weekends (clarified)
+
+HASSL supports distinguishing **weekdays**, **weekends**, and **holidays**, with holidays remaining holidays **even if they fall on weekends**.
+
+### What the compiler expects
+HASSL relies on the **Home Assistant Workday integration** configured via the UI.
+
+Create **two** Workday-based binary_sensors in *Settings → Devices & Services → Workday → Add*:
+
+1) **All-days except holidays** (used to compute “holiday”)  
+   - Name (Entity ID): `binary_sensor.hassl_<id>_not_holiday`  
+   - Workdays: **Mon–Sun**  
+   - Excludes: **holiday**  
+   - Country/Province: set to **your locale** (not required to be US/CA)
+
+2) **Weekdays** (optional, helps rule/schedule authoring for Mon–Fri)  
+   - Name (Entity ID): `binary_sensor.hassl_<id>_workday`  
+   - Workdays: **Mon–Fri**  
+   - Excludes: **holiday**  
+   - Country/Province: your locale
+
+> Replace `<id>` with the holiday set you reference in your HASSL files, e.g., `us_ca` → `binary_sensor.hassl_us_ca_not_holiday`.
+
+The compiler generates a template sensor:
+```
+binary_sensor.hassl_holiday_<id> = (binary_sensor.hassl_<id>_not_holiday == 'off')
+```
+This means **official holidays are “on”**, even when they land on a Saturday/Sunday.
+
+### Using in schedules & rules
+- **Weekdays**: guard with `condition: time -> weekday: mon..fri` (or the optional `*_workday` sensor if you prefer).  
+- **Weekends**: guard with `weekday: sat,sun`.  
+- **Holidays**: guard with `binary_sensor.hassl_holiday_<id> == 'on'`.  
+- **Not holidays**: guard with `binary_sensor.hassl_holiday_<id> == 'off'`.
+
+> Design intent: **weekend schedules do not automatically include holidays**. You can exclude or include holidays explicitly using the holiday sensor to avoid ambiguity.
 
 ---
 
@@ -214,7 +256,7 @@ light.kelvin = 2700        # also emits color_temp fallback
 ```
 - `brightness` uses `light.turn_on` with `brightness` data.
 - `kelvin` uses `light.turn_on` with `kelvin` and a computed `color_temp` fallback.
-- Other attributes default to `homeassistant.turn_on` with data.
+- Other attributes default to domain-appropriate services or `homeassistant.turn_on` with data.
 
 ---
 
@@ -261,15 +303,17 @@ Generates:
 | Feature | Introduced | Notes |
 |--------|------------|-------|
 | Modules (`package`/`import`) | v0.3.0 | Public/private exports; alias & schedule import behavior |
-| Schedule **sensors** in codegen | v0.3.0 | Emitted by `package.py` as template binary_sensors |
+| Schedule **sensors** in codegen | v0.3.0 | Template `binary_sensor.hassl_schedule_*_active` |
+| Holiday/Workday wiring | v0.3.1 | Requires UI Workday sensors; `hassl_holiday_<id>` derived |
 | Inline schedule → conditions | v0.3.0 | No helpers; compiled to `condition:` blocks |
-| Kelvin fallback | v1.4 | Emits `kelvin` + `color_temp` |
-| `wait (...)` | v1.2 | Template wait triggers |
-| `not_by` guards | v1.1 | Loop prevention |
+| Kelvin fallback | v0.2 | Emits `kelvin` + `color_temp` |
+| `wait (...)` | v0.2 | Template wait triggers |
+| `not_by` guards | v0.2 | Loop prevention |
 
 ---
 
 ## ℹ️ Notes & Limitations
 - Semicolons are only significant in **action lists** and **schedule clause** lists.
 - Schedule sensor IDs include the **declaring package** slug and the **base schedule name**; consumers should not hardcode the declaring package—use `rules_min` to resolve imported usage.
+- Workday integration must be added via **UI** (not YAML). Give entities the exact names shown above.
 - Future releases may add grouped attribute assignments and enhanced error reporting.
