@@ -239,6 +239,33 @@ def analyze(prog: Program) -> IRProgram:
 
     # NEW: collect structured windows (serialize to plain dicts)
     sched_windows: Dict[str, List[dict]] = {}
+
+ # --- helpers: normalization for day selector & holiday mode ---
+    def _norm_day_selector(ds: Optional[str]) -> str:
+        s = (ds or "").strip().lower()
+        if s in ("weekdays", "weekday", "wd", "mon-fri", "monfri"):
+            return "weekdays"
+        if s in ("weekends", "weekend", "we", "sat-sun", "satsun"):
+            return "weekends"
+        return "daily"
+
+    def _norm_holiday_mode(mode: Optional[str]) -> Optional[str]:
+        """
+        Normalize holiday text to {'only','except',None}.
+        Accepts variants like:
+        'holiday', 'only holiday', 'holiday only' -> 'only'
+        'except holiday', 'exclude holiday', 'unless holiday', 'not holiday' -> 'except'
+        """
+        if mode is None:
+            return None
+        m = str(mode).strip().lower().replace("_", " ").replace("-", " ")
+        # look for negation/exclusion first
+        if any(tok in m for tok in ("except", "exclude", "unless", "not")):
+            return "except"
+        if "holiday" in m or "only" in m:
+            return "only"
+        return None
+
     for nm, wins in local_schedule_windows.items():
         out: List[dict] = []
         for w in wins:
@@ -249,14 +276,23 @@ def analyze(prog: Program) -> IRProgram:
             if getattr(w, "period", None):
                 p = w.period  # PeriodSelector
                 period = {"kind": p.kind, "data": dict(p.data)}
+
+            # --- normalize selectors & holiday mode ---
+            day_sel = _norm_day_selector(getattr(w, "day_selector", None))
+            href    = getattr(w, "holiday_ref", None)
+            hmode   = _norm_holiday_mode(getattr(w, "holiday_mode", None))
+            # Heuristic default: if a weekdays/weekends selector references a holiday
+            # set and no mode provided, treat as "except" (workday semantics).
+            if href and hmode is None and day_sel in ("weekdays", "weekends"):
+                hmode = "except"
             out.append({
                 "start": w.start,
                 "end": w.end,
-                "day_selector": w.day_selector,
+                "day_selector": day_sel,
                 "period": period,
-                "holiday_ref": w.holiday_ref,
-                "holiday_mode": w.holiday_mode,
-           })
+                "holiday_ref": href,
+                "holiday_mode": hmode,
+            })
         if out:
             sched_windows[nm] = out
 
@@ -386,6 +422,16 @@ def analyze(prog: Program) -> IRProgram:
     # -------- NEW: validate schedule windows --------
     allowed_days = {"weekdays", "weekends", "daily"}
     for sched_name, wins in sched_windows.items():
+        # Normalize holiday modes defensively:
+        # If a window references a holiday set and also specifies a day bucket,
+        # it should be "except" (non-holiday behavior). We keep pure holiday-only
+        # windows (`day_selector == "daily"`) as "only".
+        for w in wins:
+            ds = (w.get("day_selector") or "daily").lower()
+            href = w.get("holiday_ref")
+            hmode = w.get("holiday_mode")
+            if href and ds in ("weekdays", "weekends") and (hmode is None or hmode == "only"):
+                w["holiday_mode"] = "except"
         for w in wins:
             ds = w.get("day_selector")
             if ds not in allowed_days:

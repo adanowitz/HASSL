@@ -215,7 +215,20 @@ def _holiday_condition(mode: Optional[str], hol_id: Optional[str]):
     # True when today is a holiday for 'only', false when 'except'
     eid = f"binary_sensor.hassl_holiday_{hol_id}"
     return {"condition": "state", "entity_id": eid, "state": "on" if mode == "only" else "off"}
-    
+
+def _norm_hmode(raw: Optional[str]) -> Optional[str]:
+    """Coerce analyzer-provided holiday_mode variants to {'only','except',None}."""
+    if not raw:
+        return None
+    v = str(raw).strip().lower().replace("_", " ").replace("-", " ")
+    # Accept a bunch of user/analyzer phrasings
+    if any(k in v for k in ("except", "exclude", "unless", "not")):
+        return "except"
+    if any(k in v for k in ("only", "holiday only", "holidays only")):
+        return "only"
+    # Unknown → leave as-is to avoid surprising behavior
+    return raw
+
 def _trigger_for(ts: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a HA trigger for a time-spec dict:
@@ -787,8 +800,10 @@ def emit_package(ir: IRProgram, outdir: str):
 
             ds = w.get("day_selector")
             href = w.get("holiday_ref")
-            hmode = w.get("holiday_mode")
+            hmode = _norm_hmode(w.get("holiday_mode"))
             period = w.get("period")
+            if href and hmode is None and ds in ("weekdays", "weekends"):
+                hmode = "except"
 
             # Coerce time specs to dicts compatible with _trigger_for/_window_condition_from_specs
             raw_start = w.get("start")

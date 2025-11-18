@@ -108,17 +108,18 @@ schedule_decl: PRIVATE? SCHEDULE CNAME ":" schedule_clause+
 // Clauses usable both in declarations and inline
 // Keep legacy form AND add new 'on …' forms
 schedule_clause: schedule_legacy_clause
-               | schedule_new_clause
+               | schedule_window_clause
+	       | sched_holiday_only
 
 // Legacy (unchanged)
 schedule_legacy_clause: schedule_op FROM time_spec schedule_end? ";"
 
 // NEW schedule window syntax:
-//   [during <period>] on (weekdays|weekends|daily) HH:MM-HH:MM [except holidays <id>] ;
+//   [during <period>] on (weekdaysNo, |weekends|daily) HH:MM-HH:MM [except holidays <id>] ;
 //   on holidays <id> HH:MM-HH:MM ;
-schedule_new_clause: period? "on" day_selector time_range holiday_mod? ";"
-                   | "on" "holidays" CNAME time_range ";"
+schedule_window_clause: period? "on" day_selector time_range holiday_mod? ";"
 
+sched_holiday_only: "on" "holidays" CNAME time_range ";"
 // Periods
 period: "during" "months" month_range
       | "during" "dates"  mmdd_range
@@ -131,7 +132,10 @@ MMDD: /\d{2}-\d{2}/
 ymd_range: YMD ".." YMD
 YMD: /\d{4}-\d{2}-\d{2}/
 
-day_selector: "weekdays" | "weekends" | "daily"
+WEEKDAYS: "weekdays"
+WEEKENDS: "weekends"
+DAILY:    "daily"
+day_selector: WEEKDAYS | WEEKENDS | DAILY
 time_range: TIME_HHMM "-" TIME_HHMM
 holiday_mod: "except" "holidays" CNAME
 
