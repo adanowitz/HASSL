@@ -812,9 +812,13 @@ def emit_package(ir: IRProgram, outdir: str):
                 if isinstance(ts, dict):
                     return ts
                 if isinstance(ts, str):
+                    v = ts.strip()
                     # accept "HH:MM" or "HH:MM:SS"
-                    v = ts if len(ts) in (5,8) else "00:00"
-                    return {"kind":"clock","value": v[:5] if len(v)==5 else v[:8]}
+                    if len(v) == 5:   # HH:MM
+                        return {"kind":"clock","value": v}
+                    if len(v) == 8:   # HH:MM:SS
+                        return {"kind":"clock","value": v}
+                    return {"kind":"clock","value":"00:00"}
                 return {"kind":"clock","value":"00:00"}
             start_ts = _coerce(raw_start)
             end_ts   = _coerce(raw_end)

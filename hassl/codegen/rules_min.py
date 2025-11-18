@@ -593,11 +593,11 @@ def generate_rules(ir, outdir):
                         "data": {"entity_id": full, "value": str(val)}
                     })
                 else:
-                    # Try light.turn_on data first; fallback to generic service data
-                    if eid.startswith("light."):
-                        act_list.append({"service": "light.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
-                    else:
-                        act_list.append({"service": "homeassistant.turn_on", "target": {"entity_id": eid}, "data": {attr: val}})
+                    # Unknown action type: log and skip (keeps generator robust)
+                    act_list.append({
+                        "service": "logbook.log",
+                        "data": {"name": "HASSL", "message": f"Unhandled action type: {act.get('type')}"}
+                    })
 
             conds = [gate_cond] + sched_conds + [cond_ha]
             if qual_cond:

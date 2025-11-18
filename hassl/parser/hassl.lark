@@ -11,6 +11,8 @@ stmt: package_decl
     | rule
     | schedule_decl
     | holidays_decl
+    | template_decl
+    | use_template_stmt
 
 // --- Aliases ---
 alias: PRIVATE? "alias" CNAME "=" entity //can mark private
@@ -192,7 +194,7 @@ import_tail: ".*"
 import_list: import_item ("," import_item)*
 import_item: CNAME ("as" CNAME)?
 
-// ---- Holidays declaration (NEW) ----
+// ---- Holidays declaration ----
 // Example:
 // holidays us_ca:
 //   country="US", province="CA", add=["2025-11-28"], remove=["2025-12-26"]
@@ -208,3 +210,29 @@ excludelist: ("sat"|"sun"|"holiday") ("," ("sat"|"sun"|"holiday"))*
 DAY.2: "mon"|"tue"|"wed"|"thu"|"fri"|"sat"|"sun"
 DATESTR: /"\d{4}-\d{2}-\d{2}"/
 datestr_list: DATESTR ("," DATESTR)*
+
+// === Templates ===
+TEMPLATE: "template"
+
+template_decl: PRIVATE? TEMPLATE template_kind CNAME "(" template_params? ")" ":" template_body
+template_kind: "rule" | "sync" | "schedule"
+template_params: template_param ("," template_param)*
+template_param: CNAME ("=" template_default)?
+template_default: NUMBER | STRING | CNAME
+
+template_body: rule_body    -> template_rule_body
+             | sync_body    -> template_sync_body
+             | schedule_body -> template_schedule_body
+
+// Reuse existing bodies you already parse inside rule/sync/schedule decls.
+// For MVP you can alias them to the same shapes you already produce.
+
+use_template_stmt: "use" "template" CNAME "(" call_args? ")" ("as" CNAME)?
+call_args: call_arg ("," call_arg)*
+call_arg: (CNAME "=" value) | value
+value: NUMBER | STRING | entity | CNAME
+
+// --- Minimal bodies used by template_body ---
+rule_body: rule_clause+                 // same pieces used inside a rule
+sync_body: synctype "[" entity_list "]" syncopts?
+schedule_body: schedule_clause+         // same pieces used in schedule_decl

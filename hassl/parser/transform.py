@@ -109,6 +109,94 @@ class HasslTransformer(Transformer):
             return {"name": str(parts[0]), "as": None}
         return {"name": str(parts[0]), "as": str(parts[-1])}
 
+    # ============ Templates (NEW) ============
+    # These are no-ops unless your grammar includes template_* rules.
+    # They simply build nodes and push them into self.stmts so the analyzer can expand them.
+
+    # template_decl: PRIVATE? TEMPLATE template_kind CNAME "(" template_params? ")" ":" template_body
+    def template_decl(self, *parts):
+        private = any(isinstance(p, Token) and p.type == "PRIVATE" for p in parts)
+        kind = next((str(p) for p in parts if isinstance(p, str) and p in ("rule","sync","schedule")), "rule")
+        name = None
+        params = []
+        body = None
+        seen_paren = False
+        for p in parts:
+            if isinstance(p, Token) and p.type == "CNAME" and name is None:
+                name = str(p); continue
+            # parameter list arrives as a python list (via template_params)
+            if isinstance(p, list) and p and isinstance(p[0], dict) and "name" in p[0]:
+                params = p; continue
+            # the first non-token/non-list after ':' should be the body node (Rule/Sync/Schedule body)
+            if not isinstance(p, (list, Token, str)) and p is not None:
+                body = p
+        t = nodes.TemplateDecl(kind=kind, name=str(name) if name else "", params=params, body=body, private=private)
+        self.stmts.append(t)
+        return t
+
+    def template_kind(self, tok):
+        return str(tok)
+
+    def template_params(self, *items):
+        return list(items)
+
+    # template_param: CNAME ("=" template_default)?
+    def template_param(self, name, default=None):
+        return {"name": str(name), "default": default}
+
+    # template_default: NUMBER | STRING | CNAME
+    def template_default(self, val):
+        return _atom(val)
+
+    # template_body variants – just forward the inner node as-is
+    def template_rule_body(self, body): return body
+    def template_sync_body(self, body): return body
+    def template_schedule_body(self, body): return body
+
+    def rule_body(self, *clauses):      return list(clauses)
+    def schedule_body(self, *clauses):  return list(clauses)
+    def sync_body(self, *parts):        return list(parts)
+
+    # use_template_stmt: "use" "template" CNAME "(" call_args? ")" ("as" CNAME)?
+    def use_template_stmt(self, *parts):
+        name = None
+        as_name = None
+        args = []
+        seen_as = False
+        for p in parts:
+            if isinstance(p, Token) and p.type == "CNAME":
+                if name is None:
+                    name = str(p)
+                elif seen_as and as_name is None:
+                    as_name = str(p)
+                # else: ignore stray CNAMEs (shouldn't happen if grammar is strict)
+                continue
+            if isinstance(p, list):
+                # call_args comes in as a list
+                args = p
+                continue
+            if isinstance(p, str) and p == "as":
+                seen_as = True
+                continue
+        u = nodes.UseTemplate(name=str(name) if name else "", args=args, as_name=as_name)
+        self.stmts.append(u)
+        return u
+
+    # call_args: call_arg ("," call_arg)*
+    def call_args(self, *items):
+        return list(items)
+
+    # call_arg: (CNAME "=" value) | value
+    def call_arg(self, *parts):
+        if len(parts) == 1:
+            return parts[0]
+        # name "=" value
+        return {"name": str(parts[0]), "value": parts[-1]}
+
+    # value: NUMBER | STRING | entity | CNAME
+    def value(self, v):
+        # Normalize to primitives/strings like other atoms; entities are already normalized by entity()
+        return _atom(v)
     # ============ Aliases / Sync ============
     def alias(self, *args):
         private = False
@@ -295,33 +383,6 @@ class HasslTransformer(Transformer):
 
     def time_spec(self, *children): return children[0] if children else None
     def rule_clause(self, item): return item
-
-    def sched_holiday_only(self, *args):
-        """
-        Handles:  on holidays <CNAME> HH:MM-HH:MM ;
-        Args arrive as ( 'on', 'holidays', <CNAME token>, time_range_tuple, ';' )
-        """
-        from lark import Token
-        
-        ident = None
-        start = None
-        end = None
-        
-        for a in args:
-            if isinstance(a, Token) and a.type == "CNAME":
-                ident = str(a)
-            elif isinstance(a, tuple) and a and a[0] == "time":
-                # ("time", "HH:MM", "HH:MM")
-                start, end = a[1], a[2]
-                
-        return nodes.ScheduleWindow(
-            start=str(start) if start is not None else "00:00",
-            end=str(end) if end is not None else "00:00",
-            day_selector="daily",
-            period=None,
-            holiday_ref=str(ident) if ident is not None else "",
-            holiday_mode="only",
-        )
 
     # -------- New windows & periods --------
     def schedule_window_clause(self, *parts):

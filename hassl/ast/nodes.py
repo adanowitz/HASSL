@@ -59,6 +59,20 @@ class Schedule:
     private: bool = False
 
 @dataclass
+class TemplateDecl:
+    kind: str            # "rule" | "sync" | "schedule"
+    name: str
+    params: list = field(default_factory=list) # [{"name": "light", "default": ...}, ...]
+    body: Any = None  # Rule | Sync | Schedule body shape
+    private: bool = False
+
+@dataclass
+class UseTemplate:
+    name: str            # template name being referenced
+    args: list = field(default_factory=list)  # ["pos1", {"name":"kw","value":...}, ...] 
+    as_name: Optional[str] = None
+    
+@dataclass
 class Rule:
     name: str
     # allow schedule dicts
@@ -75,7 +89,8 @@ class Program:
     def to_dict(self):
         def enc(x):
             if isinstance(x, (Alias, Sync, Rule, IfClause, Schedule,
-                              HolidaySet, ScheduleWindow, PeriodSelector)):
+                              HolidaySet, ScheduleWindow, PeriodSelector,
+                              TemplateDecl, UseTemplate)):
                 d = asdict(x); d["type"] = x.__class__.__name__; return d
             return x
         return {

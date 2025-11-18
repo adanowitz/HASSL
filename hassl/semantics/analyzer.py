@@ -1,8 +1,10 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, asdict
 from typing import Dict, List, Any, Optional, Tuple
+import copy
 from ..ast.nodes import (
     Program, Alias, Sync, Rule, Schedule,
     HolidaySet, ScheduleWindow, PeriodSelector,
+    TemplateDecl, UseTemplate,
     )
 from .domains import DOMAIN_PROPS, domain_of
 
@@ -114,8 +116,108 @@ def analyze(prog: Program) -> IRProgram:
     local_schedule_windows: Dict[str, List[ScheduleWindow]] = {}
     local_holidays: Dict[str, HolidaySet] = {}
 
-    # 1) Collect local declarations (aliases & schedules)
-    for s in prog.statements:
+    # 0) Preprocess: collect templates and expand 'use template' into concrete nodes
+    templates_by_kind: Dict[str, Dict[str, TemplateDecl]] = {"rule": {}, "sync": {}, "schedule": {}}
+
+    # Helper: build arg map (params -> values) using defaults
+    def _bind_args(t: TemplateDecl, call_args: List[Any]) -> Dict[str, Any]:
+        params = list(t.params or [])
+        # normalize params: [{"name":..., "default":...}, ...]
+        pnames = [p.get("name") for p in params]
+        defaults = {p.get("name"): p.get("default") for p in params}
+        bound: Dict[str, Any] = dict(defaults)
+        # split named vs positional args from transformer
+        pos: List[Any] = []
+        named: Dict[str, Any] = {}
+        for a in call_args or []:
+            if isinstance(a, dict) and "name" in a:
+                named[str(a["name"])] = a.get("value")
+            else:
+                pos.append(a)
+        # apply positional
+        for i, v in enumerate(pos):
+            if i < len(pnames):
+                bound[pnames[i]] = v
+        # apply named (wins over positional/default)
+        for k, v in named.items():
+            if k in pnames:
+                bound[k] = v
+        return bound
+
+    # Deep substitute param identifiers appearing as bare strings in nested dict/list trees
+    def _deep_subst(obj: Any, subst: Dict[str, Any]) -> Any:
+        # strings: replace only if exactly matches a parameter name
+        if isinstance(obj, str):
+            return str(subst.get(obj, obj))
+        # dicts/lists: walk recursively
+        if isinstance(obj, dict):
+            return {k: _deep_subst(v, subst) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_deep_subst(x, subst) for x in obj]
+        # leave everything else as-is (numbers, bools, None)
+        return obj
+
+    # Expand a single UseTemplate into a concrete node (Rule/Sync/Schedule)
+    def _instantiate(use: UseTemplate) -> Optional[Any]:
+        # Find matching template by name across kinds (prefer rule->sync->schedule)
+        t = None
+        for kind in ("rule", "sync", "schedule"):
+            t = templates_by_kind.get(kind, {}).get(use.name)
+            if t:
+                break
+        if not t:
+            return None
+        argmap = _bind_args(t, list(getattr(use, "args", []) or []))
+        original = copy.deepcopy(t.body)
+        # Plainify dataclasses/objects so deep_subst can walk them
+        if is_dataclass(original):
+            plain = asdict(original)
+        elif hasattr(original, "__dict__"):
+            # shallow mapping of fields; they will typically be lists/dicts we can walk
+            plain = copy.deepcopy(vars(original))
+        else:
+            plain = original
+        subbed = _deep_subst(plain, argmap)
+
+        # Rename resulting node if caller provided "as <name>"
+        new_name = getattr(use, "as_name", None) or getattr(getattr(t, "name", None), "strip", lambda: "")() or t.name
+
+        # Construct concrete AST node of same kind
+        if isinstance(t.body, Rule) or (getattr(t.body, "__class__", None).__name__ == "Rule"):
+            # subbed is a dict after plainify/subst
+            return Rule(name=new_name, clauses=subbed.get("clauses", getattr(original, "clauses", [])))
+        if isinstance(t.body, Sync) or (getattr(t.body, "__class__", None).__name__ == "Sync"):
+            return Sync(kind=subbed.get("kind", getattr(original, "kind", "onoff")),
+                        members=subbed.get("members", getattr(original, "members", [])),
+                        name=new_name,
+                        invert=subbed.get("invert", getattr(original, "invert", [])))
+        if isinstance(t.body, Schedule) or (getattr(t.body, "__class__", None).__name__ == "Schedule"):
+            return Schedule(name=new_name,
+                            clauses=subbed.get("clauses", getattr(original, "clauses", [])),
+                            windows=subbed.get("windows", getattr(original, "windows", [])),
+                            private=subbed.get("private", getattr(original, "private", False)))
+        return None
+
+    # Scan once to collect templates
+    for s in getattr(prog, "statements", []) or []:
+        if isinstance(s, TemplateDecl):
+            kind = (s.kind or "rule").lower()
+            if kind in templates_by_kind:
+                templates_by_kind[kind][s.name] = s
+
+    # Build a new statement list with uses expanded
+    expanded_statements: List[Any] = []
+    for s in getattr(prog, "statements", []) or []:
+        if isinstance(s, UseTemplate):
+            inst = _instantiate(s)
+            if inst is not None:
+                expanded_statements.append(inst)
+            # do not append the UseTemplate node itself
+        else:
+            expanded_statements.append(s)
+
+    # 1) Collect local declarations (aliases & schedules) from expanded statements
+    for s in expanded_statements:
         if isinstance(s, Alias):
             local_aliases[s.name] = s.entity
             is_private = getattr(s, "private", False)
@@ -224,7 +326,7 @@ def analyze(prog: Program) -> IRProgram:
 
     # --- Syncs ---
     syncs: List[IRSync] = []
-    for s in prog.statements:
+    for s in expanded_statements:
         if isinstance(s, Sync):
             mem = [_resolve_alias(m,amap) for m in s.members]
             inv = [_resolve_alias(m,amap) for m in s.invert]
@@ -375,7 +477,7 @@ def analyze(prog: Program) -> IRProgram:
                 return ent
         return obj
     
-    for s in prog.statements:
+    for s in expanded_statements:
         if isinstance(s, Rule):
             clauses: List[dict] = []
             schedule_uses: List[str] = []
