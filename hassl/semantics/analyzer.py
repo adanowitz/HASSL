@@ -62,6 +62,20 @@ class IRProgram:
             "schedules_windows": self.schedules_windows or {},  # NEW
         }
 
+def _resolve_module_id(raw_mod: str) -> str:
+    """
+    Map a raw import like 'hall.aliases' to the actual package id present in GLOBAL_EXPORTS,
+    e.g. 'home.hall.aliases'. If multiple candidates match, keep raw (fail gently).
+    """
+    if 'GLOBAL_EXPORTS' not in globals() or not raw_mod:
+        return raw_mod
+    # exact hit?
+    if any(pkg == raw_mod for (pkg, _k, _n) in globals()['GLOBAL_EXPORTS']):
+        return raw_mod
+    # suffix match (common when files declare 'home.hall.aliases' but source wrote 'hall.aliases')
+    candidates = {pkg for (pkg, _k, _n) in globals()['GLOBAL_EXPORTS'] if pkg.endswith("." + raw_mod)}
+    return next(iter(candidates)) if len(candidates) == 1 else raw_mod
+
 def _resolve_alias(e: str, amap: Dict[str,str]) -> str:
     if "." not in e and e in amap: return amap[e]
     return e
@@ -119,6 +133,26 @@ def analyze(prog: Program) -> IRProgram:
     # 0) Preprocess: collect templates and expand 'use template' into concrete nodes
     templates_by_kind: Dict[str, Dict[str, TemplateDecl]] = {"rule": {}, "sync": {}, "schedule": {}}
 
+    # Collect modules this program imports (treat bare "import X" as glob, same as you already do)
+    imported_modules = set()
+    for imp in getattr(prog, "imports", []) or []:
+        if not isinstance(imp, dict) or imp.get("type") != "import":
+            continue
+        raw_mod = imp.get("module", "")
+        mod = _resolve_module_id(raw_mod)
+        
+        if not mod:
+            continue
+        # normalize kind the same way you do later
+        kind = imp.get("kind")
+        if kind not in ("glob", "list", "alias"):
+            if imp.get("items"): kind = "list"
+            elif imp.get("as"):  kind = "alias"
+            else:                kind = "glob"
+
+        if kind in ("glob", "list", "alias"):
+            imported_modules.add(mod)
+
     # Helper: build arg map (params -> values) using defaults
     def _bind_args(t: TemplateDecl, call_args: List[Any]) -> Dict[str, Any]:
         params = list(t.params or [])
@@ -168,6 +202,15 @@ def analyze(prog: Program) -> IRProgram:
         if not t:
             return None
         argmap = _bind_args(t, list(getattr(use, "args", []) or []))
+
+        if t.body is None:
+            # Provide minimal empty bodies so deep_subst & constructors don’t break
+            if t.kind == "rule":
+                t.body = Rule(name="", clauses=[])
+            elif t.kind == "sync":
+                t.body = Sync(kind="onoff", members=[], name="", invert=[])
+            elif t.kind == "schedule":
+                t.body = Schedule(name="", clauses=[], windows=[], private=False)
         original = copy.deepcopy(t.body)
         # Plainify dataclasses/objects so deep_subst can walk them
         if is_dataclass(original):
@@ -180,7 +223,8 @@ def analyze(prog: Program) -> IRProgram:
         subbed = _deep_subst(plain, argmap)
 
         # Rename resulting node if caller provided "as <name>"
-        new_name = getattr(use, "as_name", None) or getattr(getattr(t, "name", None), "strip", lambda: "")() or t.name
+        # Rename resulting node if caller provided "as <name>" or passed name= param
+        new_name = getattr(use, "as_name", None) or str(argmap.get("name") or t.name)
 
         # Construct concrete AST node of same kind
         if isinstance(t.body, Rule) or (getattr(t.body, "__class__", None).__name__ == "Rule"):
@@ -204,6 +248,16 @@ def analyze(prog: Program) -> IRProgram:
             kind = (s.kind or "rule").lower()
             if kind in templates_by_kind:
                 templates_by_kind[kind][s.name] = s
+
+    if 'GLOBAL_EXPORTS' in globals():
+        for (pkg, kind, name), node in globals()['GLOBAL_EXPORTS'].items():
+            if kind != "template":
+                continue
+            # bring templates from any imported module
+            if pkg in imported_modules and isinstance(node, TemplateDecl):
+                tkind = (node.kind or "rule").lower()
+                if tkind in templates_by_kind and name not in templates_by_kind[tkind]:
+                    templates_by_kind[tkind][name] = node
 
     # Build a new statement list with uses expanded
     expanded_statements: List[Any] = []
@@ -275,7 +329,9 @@ def analyze(prog: Program) -> IRProgram:
         if not isinstance(imp, dict) or imp.get("type") != "import":
             # transformer may also append sentinels to statements; ignore here
             continue
-        mod = imp.get("module", "")
+        raw_mod = imp.get("module", "")
+        mod = _resolve_module_id(raw_mod)
+        
         kind = imp.get("kind")
         # Be generous: if transformer emitted "none" or omitted kind, infer it.
         if kind not in ("glob", "list", "alias"):
@@ -509,6 +565,10 @@ def analyze(prog: Program) -> IRProgram:
                     for sc in c.get("clauses") or []:
                         if isinstance(sc, dict):
                             schedules_inline.append(sc)
+                elif isinstance(c, dict) and "condition" in c and "actions" in c:
+                    cond = _walk_alias_with_qualified(c["condition"])
+                    acts = _walk_alias_with_qualified(c["actions"])
+                    clauses.append({"condition": cond, "actions": acts})
                 else:
                     # ignore unknown fragments
                     pass

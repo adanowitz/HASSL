@@ -134,7 +134,10 @@ class HasslTransformer(Transformer):
         self.stmts.append(t)
         return t
 
-    def template_kind(self, tok):
+    def template_kind(self, *toks):
+        if not toks:
+            return "rule"
+        tok = toks[0]
         return str(tok)
 
     def template_params(self, *items):
@@ -153,9 +156,19 @@ class HasslTransformer(Transformer):
     def template_sync_body(self, body): return body
     def template_schedule_body(self, body): return body
 
-    def rule_body(self, *clauses):      return list(clauses)
-    def schedule_body(self, *clauses):  return list(clauses)
-    def sync_body(self, *parts):        return list(parts)
+    # New: rule_body / schedule_body nodes for templates
+    def rule_body(self, *clauses):
+        # Produce a Rule node with empty name; analyzer will rename on instantiation
+        return nodes.Rule(name="", clauses=list(clauses))
+
+    def schedule_body(self, *clauses):
+        # Produce a Schedule node with empty name; analyzer will rename on instantiation
+        return nodes.Schedule(name="", clauses=list(clauses), windows=[])
+
+    def sync_body(self, synctype, members, syncopts=None):
+        invert = syncopts if isinstance(syncopts, list) else []
+        # name is filled later if you 'use template ... as <name>'
+        return nodes.Sync(kind=str(synctype), members=members, name="", invert=invert)
 
     # use_template_stmt: "use" "template" CNAME "(" call_args? ")" ("as" CNAME)?
     def use_template_stmt(self, *parts):
@@ -281,8 +294,11 @@ class HasslTransformer(Transformer):
         return {"type": "attr_assign", "entity": entity, "attr": attr, "value": value}
 
     def waitact(self, cond, dur, action):
-        return {"type": "wait", "condition": cond, "for": dur, "then": action}
+        return {"type": "wait", "condition": cond, "for": _atom(dur), "then": action}
 
+    def dur_arg(self, val):
+        return _atom(val)
+    
     def rulectrl(self, *parts):
         def s(x): return str(x) if isinstance(x, Token) else x
         vals = [s(p) for p in parts]

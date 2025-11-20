@@ -76,7 +76,7 @@ assign: CNAME "=" STATE ("for" dur)?
 attr_assign: CNAME "." CNAME ("." CNAME)* "." CNAME "=" NUMBER
            | CNAME "." CNAME "=" NUMBER
 
-waitact: "wait" "(" condition "for" dur ")" action
+waitact: "wait" "(" condition "for" (dur | CNAME | STRING) ")" action
 // condition used by wait(): allow expr + optional qualifier inside the parens
 condition: expr qualifier?
 
@@ -220,19 +220,19 @@ template_params: template_param ("," template_param)*
 template_param: CNAME ("=" template_default)?
 template_default: NUMBER | STRING | CNAME
 
-template_body: rule_body    -> template_rule_body
-             | sync_body    -> template_sync_body
+template_body: rule_body     -> template_rule_body
+             | sync_body     -> template_sync_body
              | schedule_body -> template_schedule_body
 
-// Reuse existing bodies you already parse inside rule/sync/schedule decls.
-// For MVP you can alias them to the same shapes you already produce.
+// --- Bodies used by template_body (define these ONCE) ---
+rule_body: rule_clause+                         // clauses without 'rule NAME:'
+sync_body: synctype "[" entity_list "]" syncopts?
+schedule_body: schedule_clause+                 // clauses without 'schedule NAME:'
 
+// Reuse existing pieces parsed elsewhere (no duplicates below this line)
+
+// --- Template invocation ---
 use_template_stmt: "use" "template" CNAME "(" call_args? ")" ("as" CNAME)?
 call_args: call_arg ("," call_arg)*
 call_arg: (CNAME "=" value) | value
 value: NUMBER | STRING | entity | CNAME
-
-// --- Minimal bodies used by template_body ---
-rule_body: rule_clause+                 // same pieces used inside a rule
-sync_body: synctype "[" entity_list "]" syncopts?
-schedule_body: schedule_clause+         // same pieces used in schedule_decl
