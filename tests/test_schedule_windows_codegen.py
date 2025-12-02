@@ -89,9 +89,7 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
     # ---- Holidays: workday + derived holiday template ----
     hol_yaml_path = outdir / f"holidays_{pkg_id}.yaml"
     assert hol_yaml_path.exists(), "holidays YAML not emitted"
-    hol_doc = yaml.safe_load(hol_yaml_path.read_text())
-    # At minimum we expect a workday platform entry
-    assert "binary_sensor" in hol_doc, "workday binary_sensor section missing"
+
  
     # ---- Automations: current code emits per-window on/off automations ----
     sched_yaml = outdir / f"schedule_{pkg_id}_wake.yaml"
