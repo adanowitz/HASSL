@@ -145,7 +145,7 @@ rule ping:
 
     # Bundled automations should include a condition referencing that binary_sensor
     bundled = (outdir / f"rules_bundled_{pkg_slug}.yaml").read_text()
-    assert f"binary_sensor.hassl_schedule_{pkg_slug}_wake_hours_active" in bundled
+    assert "binary_sensor.hassl_schedule_std_shared_wake_hours_active" in bundled
 
     # The schedules file may or may not be emitted depending on analyzer exposing schedules.
     # If present, it should contain the binary_sensor.
@@ -228,6 +228,35 @@ rule motion_light:
     assert "binary_sensor.hassl_schedule_std_shared_wake_hours_active" in bundled
 
 
+def test_window_schedule_gates_on_input_boolean(tmp_path: Path):
+    """Window schedules should gate rules using input_boolean.hassl_sched_<pkg>_<name>."""
+    landing = tmp_path / "home" / "landing.hassl"
+    _write(landing, """
+package home.landing
+alias lamp = light.kitchen
+
+schedule wake:
+  on weekdays 08:00-19:00;
+
+rule r:
+  schedule use wake;
+  if (lamp) then lamp = on
+""")
+
+    p = parse_hassl(landing.read_text()); p.package = "home.landing"
+    sem_analyzer.GLOBAL_EXPORTS = {}
+    ir = analyze(p)
+
+    outdir = tmp_path / "out_window"
+    pkg_codegen.emit_package(ir, str(outdir))
+    rules_min.generate_rules(ir.to_dict(), str(outdir))
+
+    pkg_slug = rules_min._pkg_slug(str(outdir))
+    bundled = (outdir / f"rules_bundled_{pkg_slug}.yaml").read_text()
+    # gate should reference the window helper input_boolean (package-based)
+    assert "input_boolean.hassl_sched_home_landing_wake" in bundled
+
+
 def test_schedule_use_missing_declaration_raises(tmp_path: Path):
     """Using a schedule that isn't declared/imported in this package should raise a helpful error."""
     landing = tmp_path / "home" / "landing.hassl"
@@ -253,5 +282,38 @@ rule motion_light:
     msg = str(ei.value)
     assert "schedule reference not found" in msg
     assert "wake_hours" in msg
-    # Should include the sensor id we would look for in this package
-    assert f"binary_sensor.hassl_schedule_{pkg_slug}_wake_hours_active" in msg
+    # Message should not depend on outdir slug
+    assert f"binary_sensor.hassl_schedule_{pkg_slug}_wake_hours_active" not in msg
+
+
+def test_import_alias_namespace_resolves_in_conditions_and_actions(tmp_path: Path):
+    """Qualified alias (ns.alias) should resolve to real entity IDs in IR conditions."""
+    shared = tmp_path / "std" / "shared.hassl"
+    homep = tmp_path / "home" / "landing.hassl"
+
+    _write(shared, """
+package std.shared
+alias lamp = light.kitchen_lamp
+""")
+    _write(homep, """
+package home.landing
+import std.shared as std
+import std.shared: lamp
+
+rule r:
+  if (std.lamp) then lamp = on
+""")
+
+    p_shared = parse_hassl(shared.read_text()); p_shared.package = "std.shared"
+    sem_analyzer.GLOBAL_EXPORTS = _collect_public_exports(p_shared, "std.shared")
+
+    p_home = parse_hassl(homep.read_text()); p_home.package = "home.landing"
+    ir = analyze(p_home).to_dict()
+
+    (rule,) = ir["rules"]
+    cond_expr = rule["clauses"][0]["condition"]["expr"]
+    # In condition, the qualified alias should resolve to entity id
+    assert cond_expr == "light.kitchen_lamp"
+    # Actions keep local alias names for codegen resolution
+    assigns = [a for a in rule["clauses"][0]["actions"] if a["type"] == "assign"]
+    assert {a["target"] for a in assigns} == {"lamp"}

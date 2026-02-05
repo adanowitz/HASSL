@@ -532,6 +532,20 @@ def analyze(prog: Program) -> IRProgram:
             if ent:
                 return ent
         return obj
+
+    # Resolve only qualified aliases (ns.alias) and leave unqualified aliases intact.
+    # This keeps existing IR expectations while making qualified references usable.
+    def _walk_qualified_only(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _walk_qualified_only(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_walk_qualified_only(x) for x in obj]
+        if isinstance(obj, str):
+            if "." in obj:
+                ent = _resolve_qualified_alias(obj)
+                if ent:
+                    return ent
+        return obj
     
     for s in expanded_statements:
         if isinstance(s, Rule):
@@ -545,8 +559,9 @@ def analyze(prog: Program) -> IRProgram:
                 # IfClause-like items have .condition/.actions
                 if hasattr(c, "condition") and hasattr(c, "actions"):
                     # Keep alias identifiers intact for tests & codegen (resolve later)
-                    cond = c.condition
-                    acts = c.actions
+                    # But resolve qualified aliases (ns.alias) so codegen gets real entities
+                    cond = _walk_qualified_only(c.condition)
+                    acts = _walk_qualified_only(c.actions)
                     clauses.append({"condition": cond, "actions": acts})
                 elif isinstance(c, dict) and c.get("type") == "schedule_use":
                     # {"type":"schedule_use","names":[...]}

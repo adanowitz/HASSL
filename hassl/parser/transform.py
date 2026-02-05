@@ -92,6 +92,11 @@ class HasslTransformer(Transformer):
     def import_tail(self, *args):
         if len(args) == 1 and isinstance(args[0], Token) and str(args[0]) == ".*":
             return ("glob", [], None)
+        # Some parses drop the literal "as" token; treat a single CNAME as alias target.
+        if len(args) == 1 and isinstance(args[0], (Token, str)):
+            val = str(args[0])
+            if val and val != ".*":
+                return ("alias", [], val)
         if len(args) == 2:
             a0, a1 = args
             if isinstance(a0, Token) and str(a0) == ":":

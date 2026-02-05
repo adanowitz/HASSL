@@ -2,7 +2,7 @@
 
 > **Home Assistant Simple Scripting Language**
 
-![Version](https://img.shields.io/badge/version-v0.3.1-blue)
+![Version](https://img.shields.io/badge/version-v0.4.0-blue)
 
 HASSL is a human-friendly domain-specific language (DSL) for building **loop-safe**, **deterministic**, and **composable** automations for [Home Assistant](https://www.home-assistant.io/).
 
@@ -15,7 +15,7 @@ It compiles lightweight `.hassl` scripts into fully functional YAML packages tha
 - **Readable DSL** → write logic like natural language (`if motion && lux < 50 then light = on`)
 - **Sync devices** → keep switches, dimmers, and fans perfectly in sync
 - **Schedules** → declare time-based gates (`enable from 08:00 until 19:00`)
-- **Weekday/weekend/holiday schedules** → full support for Home Assistant’s **Workday integration** (v0.3.1)
+- **Weekday/weekend/holiday schedules** → full support for Home Assistant’s **Workday integration** (v0.4.0)
 - **Loop-safe** → context ID tracking prevents feedback loops
 - **Per-rule enable gates** → `disable rule` or `enable rule` dynamically
 - **Inline waits** → `wait (!motion for 10m)` works like native HA triggers
@@ -133,7 +133,7 @@ Each `.hassl` file compiles into an isolated package — no naming collisions, n
 | `scripts_<pkg>.yaml`       | Writer scripts with context stamping          |
 | `sync_<pkg>_*.yaml`        | Sync automations for each property            |
 | `rules_bundled_<pkg>.yaml` | Rule logic automations + schedules            |
-| `schedules_<pkg>.yaml`     | Time/sun-based schedule sensors (v0.3.1)      |
+| `schedules_<pkg>.yaml`     | Time/sun-based schedule sensors (v0.4.0)      |
 
 ---
 
@@ -166,7 +166,7 @@ All schedules are restart-safe:
 
 ---
 
-## 🗓️ Holiday & Workday Integration (v0.3.1)
+## 🗓️ Holiday & Workday Integration (v0.4.0)
 
 HASSL now supports `holidays <id>:` schedules tied to Home Assistant’s **Workday** integration.
 
@@ -223,7 +223,7 @@ Once created, HASSL automatically references them in generated automations.
 
 ## ⚗️ Experimental: Date & Month Range Schedules
 
-HASSL v0.3.1 includes early support for:
+HASSL v0.4.0 includes early support for:
 
 ```hassl
 on months Jun–Aug 07:00–22:00;

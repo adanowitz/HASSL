@@ -331,10 +331,15 @@ def _collect_schedules(ir: dict):
     inline_by_rule = {}
     use_by_rule = {}
 
-    # top-level declared schedules
+    # top-level declared schedules (legacy clauses)
     schedules_obj = ir.get("schedules") or {}
     if isinstance(schedules_obj, dict):
         declared = {str(k): (v or []) for k, v in schedules_obj.items()}
+    # include window schedules as declared (no legacy clauses, but valid names)
+    windows_obj = ir.get("schedules_windows") or {}
+    if isinstance(windows_obj, dict):
+        for k in windows_obj.keys():
+            declared.setdefault(str(k), [])
 
     # per-rule data
     for rule in ir.get("rules", []):
@@ -359,7 +364,7 @@ def generate_rules(ir, outdir):
     # collect helper keys we must ensure exist
     ctx_inputs = {}
 
-    # package slug for schedule sensor ids
+    # package slug for output file naming
     pkg = _pkg_slug(outdir)
 
     # --- schedules collection ---
@@ -385,16 +390,14 @@ def generate_rules(ir, outdir):
         for nm in (use_by_rule.get(rname, []) or []):
             base = str(nm).split(".")[-1]
             if base not in declared_base_names and (base not in exported_sched_pkgs):
-                expected_sensor = _schedule_sensor(base, pkg)
                 raise ValueError(
                     "HASSL: schedule reference not found. "
                     f"Rule '{rname}' uses schedule '{nm}', but no schedule named '{base}' "
-                    f"was declared in this package '{pkg}'.\n\n"
+                    "was declared in this package.\n\n"
                     "Declare it with:\n"
                     f"  schedule {base}:\n"
                     "    enable from <start> to <end>;\n\n"
                     "Or ensure the schedule is declared in the same package.\n"
-                    f"(If you expected a sensor, codegen looks for: {expected_sensor})"
                 )
 
     # NOTE: No helper creation here — package.py owns schedule sensors.
@@ -415,15 +418,6 @@ def generate_rules(ir, outdir):
         if rule_gates:
             for g in rule_gates:
                 ents = [e for e in (g.get("entities") or []) if isinstance(e, str)]
-                # Also include the legacy, current-outdir slug binary_sensor expected by older tests/code
-                # Determine the base schedule name, then synthesize the local sensor id.
-                resolved = str(g.get("resolved", "")) if isinstance(g.get("resolved", ""), str) else ""
-                base = resolved.rsplit(".", 1)[-1] if resolved else None
-                if base:
-                    legacy_local = _schedule_sensor(base, pkg)  # e.g., binary_sensor.hassl_schedule_out_std_<base>_active
-                    if legacy_local not in ents:
-                        ents.append(legacy_local)
-                        
                 if not ents:
                     continue
                 if len(ents) == 1:

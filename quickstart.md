@@ -1,4 +1,4 @@
-# HASSL Quickstart (v1.4 – 2025 Edition, v0.3.1 Update)
+# HASSL Quickstart (v1.4 – 2025 Edition, v0.4.0 Update)
 
 Welcome to **HASSL**, the Home Assistant Simple Scripting Language — a compact, human-readable DSL that compiles into reliable, loop-safe Home Assistant automations.
 
@@ -8,7 +8,7 @@ This quickstart helps you:
 - ✍️ Write your first `.hassl` file
 - ⚙️ Compile to a working Home Assistant package
 - 🔍 Test and extend automations
-- 📅 Configure Workday and Holiday-aware schedules (v0.3.1)
+- 📅 Configure Workday and Holiday-aware schedules (v0.4.0)
 
 ---
 
@@ -76,7 +76,7 @@ This generates a complete package containing:
 | `scripts_living_room.yaml`       | Context-aware writer scripts                                      |
 | `sync_living_room_*.yaml`        | Device and proxy synchronization automations                      |
 | `rules_bundled_living_room.yaml` | Rule logic automations                                            |
-| `schedules_living_room.yaml`     | Template schedule sensors and time/sun gating (v0.3.1)            |
+| `schedules_living_room.yaml`     | Template schedule sensors and time/sun gating (v0.4.0)            |
 
 All filenames include the package slug to avoid collisions between multiple HASSL integrations.
 
@@ -133,9 +133,9 @@ HASSL automatically:
 
 ---
 
-## 7. 🗓️ Add Workday & Holiday-Aware Schedules (v0.3.1)
+## 7. 🗓️ Add Workday & Holiday-Aware Schedules (v0.4.0)
 
-HASSL 0.3.1 adds full **weekday/weekend/holiday** support through the Home Assistant **Workday integration**.
+HASSL 0.4.0 adds full **weekday/weekend/holiday** support through the Home Assistant **Workday integration**.
 
 ### Step 1 — Create two Workday sensors in Home Assistant
 
@@ -207,7 +207,7 @@ rule warm_light_evening:
 
 ## 9. 🧠 Learn more
 
-See the [HASSL Language Specification](./hassl_language_spec_v1.4_2025_updated_v0.3.1.md) for detailed grammar and semantics, including package imports, private exports, and schedule sensor logic.
+See the [HASSL Language Specification](./Hassl_spec.md) for detailed grammar and semantics, including package imports, private exports, and schedule sensor logic.
 
 ---
 

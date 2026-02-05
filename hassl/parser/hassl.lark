@@ -125,7 +125,7 @@ schedule_end: TO time_spec    -> schedule_to
             | UNTIL time_spec -> schedule_until
 
 // Rule-level usage
-rule_schedule_use: SCHEDULE USE name_list ";"
+rule_schedule_use: SCHEDULE USE name_list ";"?
 // allow qualified (pkg.symbol) via existing 'entity' rule
 name_list: name ("," name)*
 name: CNAME | entity

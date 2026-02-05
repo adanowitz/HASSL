@@ -1,12 +1,12 @@
 # HASSL Language Specification (v1.4 – 2025 Edition)
-_Updated for toolchain **v0.3.1** (imports/visibility; schedule sensors; safer Jinja; holiday/workday clarifications)._
+_Updated for toolchain **v0.4.0** (templates; schedule windows; import aliasing; schedule gate helpers)._
   
 This document describes the grammar, semantics, and runtime model for  
 **HASSL** — the *Home Assistant Simple Scripting Language.*
 
 ---
 
-## 📦 Modules & Visibility (NEW in v0.3.x)
+## 📦 Modules & Visibility (v0.4.0)
 
 HASSL sources live in **packages** and can **import** other packages.
 
@@ -39,9 +39,11 @@ schedule wake_hours:
 
 ## 📐 Grammar (EBNF)
 
-> Notes for v0.3.x:
-> - Added `package`, `import`, and `private`.
-> - Semicolons (`;`) are **required only** inside `then` action lists and in `schedule` clause lists.
+> Notes for v0.4.0:
+> - Added `template` / `use template`.
+> - Added schedule window syntax (`on weekdays 08:00-19:00`), plus holiday modifiers.
+> - `import ... as <ns>` and `import pkg: a, b as c` are supported.
+> - Semicolons (`;`) are **required only** inside `then` action lists and in `schedule` clause lists. `schedule use` accepts an optional semicolon.
 > - Top-level statements do **not** require trailing semicolons.
 
 ```ebnf
@@ -51,9 +53,12 @@ package_decl   = "package" package_name ;
 import_decl    = "import" import_spec ";"? ;
 package_name   = ident {"." ident} ;
 import_spec    = package_name ".*"           # public exports of a package
+               | package_name ":" import_list
+               | package_name "as" ident
                | package_name                # (reserved for future selective)
 
-statement      = alias_stmt | sync_stmt | rule_stmt | schedule_decl ;
+statement      = alias_stmt | sync_stmt | rule_stmt | schedule_decl | holidays_decl
+               | template_decl | use_template_stmt ;
 
 # --- Aliases ---
 alias_stmt     = ["private"] "alias" ident "=" entity ;
@@ -72,16 +77,29 @@ rule_item      = if_clause | rule_schedule_use | rule_schedule_inline ;
 if_clause      = "if" "(" expression [ qualifier ] ")" [ qualifier ]
                  "then" actions ;                       # actions require ';' separators
 
-rule_schedule_use    = "schedule" "use" ident_list ";" ;
+rule_schedule_use    = "schedule" "use" ident_list [ ";" ] ;
 rule_schedule_inline = "schedule" schedule_clause+ ;    # clauses end with ';'
 
 ident_list     = ident { "," ident } ;
 
 # --- Schedules (top-level declaration) ---
 schedule_decl  = "schedule" ident ":" schedule_clause+ ;  # clauses end with ';'
-schedule_clause = schedule_op ["from" time_spec] [ schedule_end ] ";" ;
+schedule_clause = schedule_legacy_clause | schedule_window_clause | schedule_holiday_only ;
+schedule_legacy_clause = schedule_op ["from" time_spec] [ schedule_end ] ";" ;
+schedule_window_clause = [period] "on" day_selector time_range [holiday_mod] ";" ;
+schedule_holiday_only  = "on" "holidays" ident time_range ";" ;
 schedule_op    = "enable" | "disable" ;
 schedule_end   = "to" time_spec | "until" time_spec ;
+day_selector   = "weekdays" | "weekends" | "daily" ;
+time_range     = time_hhmm "-" time_hhmm ;
+holiday_mod    = "except" "holidays" ident ;
+
+period         = "during" "months" month_range
+               | "during" "dates"  mmdd_range
+               | "during" "range"  ymd_range ;
+month_range    = MONTH [".." MONTH] { "," MONTH } ;
+mmdd_range     = MMDD ".." MMDD ;
+ymd_range      = YMD ".." YMD ;
 
 time_spec      = time_clock | time_sun | entity | ident ;
 time_clock     = time_hhmm ;
@@ -119,6 +137,17 @@ wait_action    = "wait" "(" condition "for" duration ")" action ;
 rule_ctrl      = ("disable" | "enable") "rule" ident ("for" duration | "until" time_spec) ;
 tag_action     = "tag" ident "=" (string | number | ident) ;
 
+# --- Templates ---
+template_decl  = ["private"] "template" template_kind ident "(" [template_params] ")" ":" template_body ;
+template_kind  = "rule" | "sync" | "schedule" ;
+template_params = template_param { "," template_param } ;
+template_param = ident [ "=" template_default ] ;
+template_default = number | string | ident ;
+template_body  = rule_body | sync_body | schedule_body ;
+use_template_stmt = "use" "template" ident "(" [call_args] ")" ["as" ident] ;
+call_args      = call_arg { "," call_arg } ;
+call_arg       = ident "=" value | value ;
+
 # --- Atoms ---
 entity         = ident "." ident { "." ident } ;
 ident          = letter { letter | digit | "_" } ;
@@ -126,9 +155,10 @@ state          = "on" | "off" ;
 duration       = number ( "ms" | "s" | "m" | "h" | "d" ) ;
 ```
 
-### Semicolon Rules (v0.3.x)
+### Semicolon Rules (v0.4.0)
 - **Required** between actions in `then` blocks and between `schedule` clauses.
-- **Optional/unused** elsewhere (e.g., after `import` is allowed, but not required).
+- **Optional** after `schedule use <name>` and `import`.
+- **Unused** elsewhere (top-level statements do not require trailing semicolons).
 
 ---
 
@@ -166,6 +196,24 @@ rule motion_light:
 - **Qualifiers** (loop protection): `not_by this`, `not_by any_hassl`, `not_by rule("other")`.
 - Each rule has a gate: `input_boolean.hassl_gate_<rule_name>` (default **on**).
 
+### 🧩 Templates (NEW in v0.4.0)
+```hassl
+template rule motion_light(name, motion, lux, light, sched=anytime):
+  schedule use sched
+  if (motion && lux < 50) then light = on
+
+use template motion_light(
+  name="kitchen_motion",
+  motion=motion.kitchen,
+  lux=sensor.kitchen_lux,
+  light=light.kitchen_main
+)
+```
+- Templates can target **rule**, **sync**, or **schedule** bodies.
+- `use template` expands to a concrete rule/sync/schedule at compile time.
+- The resulting rule name is taken from `as <name>` or the `name=` argument if provided.
+- Parameters support defaults and named/positional arguments.
+
 ### ⏳ Waits
 ```hassl
 wait (!motion for 10m) light = off
@@ -181,7 +229,7 @@ enable rule night_scene until sunrise+15m
 
 ---
 
-## 🕒 Schedules (v0.3.x tooling behavior)
+## 🕒 Schedules (v0.4.0 tooling behavior)
 
 ### Top-level Declarations
 ```hassl
@@ -196,8 +244,21 @@ binary_sensor.hassl_schedule_<package>_<name>_active
   - clock windows with wrap (e.g., `22:00..06:00`),
   - sun windows with offsets (e.g., `sunrise+15m`),
   - OR-of-ENABLE minus OR-of-DISABLE clauses.
-- Rules that `schedule use <name>;` add a `condition: state` on that sensor.
+- Rules that `schedule use <name>` add a gate condition for that sensor.
 - Importing packages **reuses** the declaring package’s sensor name; resolution is based on the schedule’s **base name** and the **declaring package**.
+
+### Window Schedules (NEW in v0.4.0)
+```hassl
+schedule wake:
+  on weekdays 08:00-19:00;
+  on weekends 09:00-22:00 except holidays us;
+  on holidays us 10:00-21:00;
+```
+**Codegen** emits an **input_boolean** gate per schedule window set:
+```
+input_boolean.hassl_sched_<package>_<name>
+```
+Rules gate on **either** the window boolean or the legacy binary_sensor (OR’d), so older schedule forms and new window forms interoperate.
 
 ### Inline Rule Schedules
 ```hassl
@@ -303,7 +364,9 @@ Generates:
 | Feature | Introduced | Notes |
 |--------|------------|-------|
 | Modules (`package`/`import`) | v0.3.0 | Public/private exports; alias & schedule import behavior |
+| Templates (`template` / `use template`) | v0.4.0 | Compile-time rule/sync/schedule expansion |
 | Schedule **sensors** in codegen | v0.3.0 | Template `binary_sensor.hassl_schedule_*_active` |
+| Window schedules (`on weekdays ...`) | v0.4.0 | `input_boolean.hassl_sched_*` gate + per-window automations |
 | Holiday/Workday wiring | v0.3.1 | Requires UI Workday sensors; `hassl_holiday_<id>` derived |
 | Inline schedule → conditions | v0.3.0 | No helpers; compiled to `condition:` blocks |
 | Kelvin fallback | v0.2 | Emits `kelvin` + `color_temp` |
