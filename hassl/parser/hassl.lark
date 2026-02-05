@@ -2,6 +2,7 @@
 // + additive schedule support
 // + packages/imports + private visibility
 
+
 start: stmt*
 
 stmt: package_decl
@@ -20,11 +21,6 @@ alias: PRIVATE? "alias" CNAME "=" entity //can mark private
 // --- Sync ---
 sync: "sync" synctype "[" entity_list "]" "as" CNAME syncopts?
 
-ONOFF: "onoff"
-DIMMER: "dimmer"
-ATTRIBUTE: "attribute"
-SHARED: "shared"
-ALL: "all"
 synctype: ONOFF | DIMMER | ATTRIBUTE | SHARED | ALL
 
 syncopts: "{" ("invert" ":" entity_list) "}"
@@ -90,20 +86,6 @@ UNIT: "ms" | "s" | "m" | "h" | "d"
 // Timepoint placeholder (kept simple)
 timepoint: CNAME
 
-SCHEDULE: "schedule"
-USE: "use"
-FROM: "from"
-TO: "to"
-UNTIL: "until"
-ENABLE: "enable"
-DISABLE: "disable"
-SUNRISE: "sunrise"
-SUNSET: "sunset"
-PRIVATE: "private"
-
-TIME_HHMM: /[0-2]?\d:[0-5]\d/
-OFFSET: /[+-]\d+(ms|s|m|h|d)/
-
 // Reusable named schedule declarations
 schedule_decl: PRIVATE? SCHEDULE CNAME ":" schedule_clause+
 
@@ -134,9 +116,6 @@ MMDD: /\d{2}-\d{2}/
 ymd_range: YMD ".." YMD
 YMD: /\d{4}-\d{2}-\d{2}/
 
-WEEKDAYS: "weekdays"
-WEEKENDS: "weekends"
-DAILY:    "daily"
 day_selector: WEEKDAYS | WEEKENDS | DAILY
 time_range: TIME_HHMM "-" TIME_HHMM
 holiday_mod: "except" "holidays" CNAME
@@ -168,12 +147,41 @@ member: entity | CNAME
 
 entity: CNAME ("." CNAME)+
 
+
 // ---- Lexer ----
-%import common.CNAME
-%import common.WS
+// Order matters: keyword terminals first so they take precedence over CNAME
+SCHEDULE: "schedule"
+USE: "use"
+FROM: "from"
+TO: "to"
+UNTIL: "until"
+ENABLE: "enable"
+DISABLE: "disable"
+SUNRISE: "sunrise"
+SUNSET: "sunset"
+PRIVATE: "private"
+TEMPLATE: "template"
+
+ONOFF: "onoff"
+DIMMER: "dimmer"
+ATTRIBUTE: "attribute"
+SHARED: "shared"
+ALL: "all"
+WEEKDAYS: "weekdays"
+WEEKENDS: "weekends"
+DAILY:    "daily"
+
 %import common.ESCAPED_STRING -> STRING
 %import common.INT
 %import common.SIGNED_NUMBER
+%import common.WS
+
+// Override CNAME after keywords, so keywords win
+CNAME: /[a-zA-Z_][a-zA-Z0-9_]*/
+
+TIME_HHMM: /[0-2]?\d:[0-5]\d/
+OFFSET: /[+-]\d+(ms|s|m|h|d)/
+
 LINE_COMMENT: /\/\/[^\n]*/
 %ignore LINE_COMMENT
 %ignore WS
@@ -211,9 +219,7 @@ DAY.2: "mon"|"tue"|"wed"|"thu"|"fri"|"sat"|"sun"
 DATESTR: /"\d{4}-\d{2}-\d{2}"/
 datestr_list: DATESTR ("," DATESTR)*
 
-// === Templates ===
-TEMPLATE: "template"
-
+// === Template
 template_decl: PRIVATE? TEMPLATE template_kind CNAME "(" template_params? ")" ":" template_body
 template_kind: "rule" | "sync" | "schedule"
 template_params: template_param ("," template_param)*
