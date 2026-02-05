@@ -119,3 +119,95 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
     )
     assert has_weekdays, "expected a weekday time condition"
     assert has_weekends, "expected a weekend time condition"
+
+
+def test_schedule_windows_with_periods_and_mixed_days(tmp_path: Path):
+    """
+    Verifies period sensors are created and used for windows with:
+      - absolute date ranges (YYYY-MM-DD..YYYY-MM-DD)
+      - month-day ranges (MM-DD..MM-DD) including wrap
+      - mixed weekdays/weekends windows in the same schedule
+    """
+    ir = IRProgram(
+        aliases={},
+        syncs=[],
+        rules=[],
+        schedules={},
+        schedules_windows={
+            "seasonal": [
+                # Weekdays during a fixed range
+                {
+                    "start": {"kind": "clock", "value": "08:00"},
+                    "end":   {"kind": "clock", "value": "18:00"},
+                    "day_selector": "weekdays",
+                    "period": {"kind": "range", "data": {"start": "2025-03-01", "end": "2025-03-31"}},
+                    "holiday_ref": "us",
+                    "holiday_mode": "except",
+                },
+                # Weekends during an MM-DD range (wraps across year)
+                {
+                    "start": {"kind": "clock", "value": "09:00"},
+                    "end":   {"kind": "clock", "value": "21:00"},
+                    "day_selector": "weekends",
+                    "period": {"kind": "dates", "data": {"start": "11-15", "end": "02-10"}},
+                    "holiday_ref": None,
+                    "holiday_mode": None,
+                },
+            ]
+        },
+        holidays={
+            "us": {
+                "id": "us",
+                "country": "US",
+                "province": None,
+                "add": [],
+                "remove": [],
+                "workdays": [],
+                "excludes": [],
+            }
+        },
+    )
+    setattr(ir, "package", "home.seasonal")
+
+    outdir = tmp_path / "out_home_seasonal"
+    pkg_codegen.emit_package(ir, str(outdir))
+
+    pkg_id = getattr(ir, "package", "pkg")
+    sched_yaml = outdir / f"schedule_{pkg_id}_seasonal.yaml"
+    assert sched_yaml.exists(), "per-schedule automation YAML not emitted"
+
+    doc = _read_yaml(sched_yaml)
+    autos = doc.get("automation") or []
+
+    # Expect period sensors to exist (binary_sensor.hassl_period_*)
+    helpers = _read_yaml(outdir / f"helpers_{pkg_id}.yaml")
+    templates = helpers.get("template") or {}
+    # If template section isn't present in helpers, period sensors may be in schedules file.
+    # Fall back to scanning automations for "binary_sensor.hassl_period_" entity ids.
+    period_in_helpers = any("hassl_period_" in k for k in templates.keys())
+    period_in_autos = any(
+        any(
+            isinstance(c, dict)
+            and c.get("condition") == "state"
+            and isinstance(c.get("entity_id"), str)
+            and "binary_sensor.hassl_period_" in c.get("entity_id")
+            for c in (a.get("condition") or [])
+        )
+        for a in autos
+    )
+    assert period_in_helpers or period_in_autos, "expected period sensor to be referenced"
+
+    # Spot-check that both weekday and weekend conditions exist
+    def _conds(auto):
+        for c in auto.get("condition") or []:
+            yield c
+    has_weekdays = any(
+        any(c.get("condition") == "time" and c.get("weekday") == ["mon","tue","wed","thu","fri"] for c in _conds(a))
+        for a in autos
+    )
+    has_weekends = any(
+        any(c.get("condition") == "time" and c.get("weekday") == ["sat","sun"] for c in _conds(a))
+        for a in autos
+    )
+    assert has_weekdays, "expected a weekday time condition"
+    assert has_weekends, "expected a weekend time condition"
