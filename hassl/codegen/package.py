@@ -1,4 +1,5 @@
 from typing import Dict, List, Iterable, Any, Tuple, Optional
+import copy
 import os, re
 from dataclasses import dataclass, field
 from ..semantics.analyzer import IRProgram, IRSync
@@ -794,6 +795,7 @@ def emit_package(ir: IRProgram, outdir: str):
 
         # Build OR-of-windows condition bundles
         or_conditions: List[Dict[str, Any]] = []
+        off_automations: List[Dict[str, Any]] = []
         need_sun_triggers = False
 
         for idx, w in enumerate(wins):
@@ -864,6 +866,17 @@ def emit_package(ir: IRProgram, outdir: str):
             if ec:
                 off_auto["condition"] = ec
             per_schedule_automations.setdefault(sched_name, []).append(off_auto)
+            off_automations.append(off_auto)
+
+        # An ending window may overlap another active window. Only lower the
+        # shared schedule helper when the combined schedule is actually inactive;
+        # otherwise consumers would observe a false stop/start transition.
+        combined_inactive = {
+            "condition": "not",
+            "conditions": [{"condition": "or", "conditions": or_conditions}],
+        }
+        for off_auto in off_automations:
+            off_auto.setdefault("condition", []).append(copy.deepcopy(combined_inactive))
             
         # Composite choose: ON when any window matches, else OFF
         choose_block = [{

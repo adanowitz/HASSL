@@ -31,10 +31,15 @@ syncopts: "{" ("invert" ":" entity_list) "}"
 rule: "rule" CNAME ":" rule_clause+
 
 rule_clause: if_clause
+           | at_clause
            | rule_schedule_use      // NEW
            | rule_schedule_inline   // NEW
+           | arm_clause
 
 if_clause: "if" "(" expr qualifier? ")" qualifier? "then" actions
+at_clause: "at" (time_spec | schedule_transition) "then" actions
+schedule_transition: SCHEDULE SCHEDULE_TRANSITION
+arm_clause: "arm" "when" "(" expr qualifier? ")" qualifier? ";"?
 
 // ---- Conditions ----
 qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
@@ -47,8 +52,11 @@ qualifier: "not_by" ( "this" | "any_hassl" | "rule" "(" CNAME ")" )
     | "(" expr ")"
     | comparison
 
-comparison: operand OP operand
-          | operand                -> bare_operand
+comparison: operand "is" event_keyword     -> event_match
+          | operand OP operand
+          | operand                         -> bare_operand
+
+event_keyword: CNAME | STRING
 
 OP: "==" | "!=" | "<" | ">" | "<=" | ">="
 
@@ -151,6 +159,7 @@ entity: CNAME ("." CNAME)+
 // ---- Lexer ----
 // Order matters: keyword terminals first so they take precedence over CNAME
 SCHEDULE: "schedule"
+SCHEDULE_TRANSITION.2: "start" | "stop"
 USE: "use"
 FROM: "from"
 TO: "to"
@@ -179,7 +188,7 @@ DAILY:    "daily"
 // Override CNAME after keywords, so keywords win
 CNAME: /[a-zA-Z_][a-zA-Z0-9_]*/
 
-TIME_HHMM: /[0-2]?\d:[0-5]\d/
+TIME_HHMM.2: /[0-2]?\d:[0-5]\d/
 OFFSET: /[+-]\d+(ms|s|m|h|d)/
 
 LINE_COMMENT: /\/\/[^\n]*/
@@ -242,3 +251,5 @@ use_template_stmt: "use" "template" CNAME "(" call_args? ")" ("as" CNAME)?
 call_args: call_arg ("," call_arg)*
 call_arg: (CNAME "=" value) | value
 value: NUMBER | STRING | entity | CNAME
+     | TIME_HHMM -> time_clock
+     | sun_spec

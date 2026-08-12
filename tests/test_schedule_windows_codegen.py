@@ -105,6 +105,19 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
                                        and step.get("target", {}).get("entity_id") == f"input_boolean.{expect_key}"
                                        for step in (a.get("action") or [])))
 
+    # Ending one window must not lower the shared helper while another window
+    # still matches, or schedule consumers would see a false stop/start edge.
+    off_autos = [a for a in autos if " off_" in a.get("alias", "")]
+    assert off_autos
+    assert all(
+        any(
+            c.get("condition") == "not"
+            and (c.get("conditions") or [{}])[0].get("condition") == "or"
+            for c in a.get("condition", [])
+        )
+        for a in off_autos
+    )
+
     # Spot-check that at least one weekday condition and one weekend condition exist
     def _conds(auto):
         for c in auto.get("condition") or []:

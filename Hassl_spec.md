@@ -1,5 +1,5 @@
 # HASSL Language Specification (v1.4 – 2025 Edition)
-_Updated for toolchain **v0.4.0** (templates; schedule windows; import aliasing; schedule gate helpers)._
+_Updated for toolchain **v0.5.0** (timed rules; schedule transitions; event gestures; rule arming)._
   
 This document describes the grammar, semantics, and runtime model for  
 **HASSL** — the *Home Assistant Simple Scripting Language.*
@@ -72,10 +72,16 @@ entity_list    = entity { "," entity } ;
 
 # --- Rules ---
 rule_stmt      = "rule" ident ":" { rule_item } ;
-rule_item      = if_clause | rule_schedule_use | rule_schedule_inline ;
+rule_item      = if_clause | at_clause | rule_schedule_use | rule_schedule_inline | arm_clause ;
 
 if_clause      = "if" "(" expression [ qualifier ] ")" [ qualifier ]
                  "then" actions ;                       # actions require ';' separators
+
+at_clause      = "at" ( time_spec | schedule_transition ) "then" actions ;
+schedule_transition = "schedule" ( "start" | "stop" ) ;
+
+arm_clause     = "arm" "when" "(" expression [ qualifier ] ")"
+                 [ qualifier ] [ ";" ] ;
 
 rule_schedule_use    = "schedule" "use" ident_list [ ";" ] ;
 rule_schedule_inline = "schedule" schedule_clause+ ;    # clauses end with ';'
@@ -193,8 +199,46 @@ rule motion_light:
   wait (!motion for 10m) light = off
 ```
 - Boolean expressions support `&&`, `||`, `!`, comparisons, and aliases.
+- A bare `button.*` or `input_button.*` operand matches a press event (a real
+  state transition), so it can be combined with persistent state conditions:
+  `if (button.movie_scene && binary_sensor.room_occupied) then ...`.
+- A bare `event.*` operand matches each event emitted by that entity. Compare it
+  to an event type to select a specific interaction. Event types may be written
+  as identifiers or strings:
+  `if (event.wesley_switch_button_7 == short_release) then ...`.
+  For devices that emit both `initial_press` and `short_release`, filter for
+  `short_release` to run an action once per completed button press.
+- Friendly event gestures use `is <keyword>` and normalize legacy integration
+  event names with Home Assistant's standard names:
+
+  | HASSL gesture | Matching event types |
+  | --- | --- |
+  | `is pressed` | `initial_press`, `press_start` |
+  | `is clicked` | `short_release`, `press_end` |
+  | `is held` | `long_press`, `long_press_start` |
+  | `is hold_released` | `long_release`, `long_press_end` |
+  | `is multi_pressing` | `multi_press_ongoing` |
+  | `is multi_pressed` | `multi_press_complete`, `multi_press_end` |
+
+  Example: `if (wesley_button is clicked) then light = on`.
+  Unknown keywords are treated as raw integration event types, so vendor-specific
+  events remain usable without a HASSL update.
 - **Qualifiers** (loop protection): `not_by this`, `not_by any_hassl`, `not_by rule("other")`.
 - Each rule has a gate: `input_boolean.hassl_gate_<rule_name>` (default **on**).
+
+### First-Activation Arming (NEW)
+```hassl
+rule hallway_motion:
+  schedule use evening_hours;
+  arm when (light == on) not_by this;
+  if (motion) then light = on
+```
+- An armed rule starts blocked and uses `input_boolean.hassl_armed_<rule_name>` as a latch.
+- The latch turns on when the `arm when` condition becomes true while the named schedule is active.
+- The latch turns off when the effective named schedule becomes inactive, so the next schedule period starts blocked.
+- `not_by this` allows another HASSL rule or an external action to arm the rule.
+- `not_by any_hassl` requires a manual or non-HASSL action to arm the rule.
+- `arm when` requires at least one named `schedule use` clause.
 
 ### 🧩 Templates (NEW in v0.4.0)
 ```hassl
@@ -213,6 +257,53 @@ use template motion_light(
 - `use template` expands to a concrete rule/sync/schedule at compile time.
 - The resulting rule name is taken from `as <name>` or the `name=` argument if provided.
 - Parameters support defaults and named/positional arguments.
+
+### Timed rules
+
+An `at` clause runs its actions from a native Home Assistant clock or sun
+trigger. It accepts `HH:MM`, `sunrise`, `sunset`, and signed offsets:
+
+```hassl
+template rule timed_light(name, light, turn_on, turn_off, sched=anytime):
+  schedule use sched
+  at turn_on then light = on
+  at turn_off then light = off
+```
+
+Clock and sun values remain typed when passed into a template:
+
+```hassl
+use template timed_light(
+  name=porch_evening,
+  light=light.porch,
+  turn_on=sunset-30m,
+  turn_off=23:15,
+  sched=anytime
+)
+```
+
+Other valid values include `sunrise`, `sunrise+20m`, and `sunset+1h`. The named
+schedule is evaluated as a gate when each trigger fires. `anytime` is not a
+built-in schedule; it must be declared locally or imported like any other named
+schedule.
+
+A rule can also run actions when the combined state of its named schedules
+changes:
+
+```hassl
+rule porch_lighting:
+  schedule use porch_hours
+  at schedule start then light.porch = on
+  at schedule stop then light.porch = off
+```
+
+`at schedule start` runs when the effective schedule changes from inactive to
+active; `at schedule stop` runs for the reverse transition. Multiple schedules
+in `schedule use` are combined with AND. Overlapping windows therefore produce
+one start and one final stop. Home Assistant startup also runs the clause that
+matches the current effective state so device state is reconciled after a
+restart. Re-enabling the rule performs the same reconciliation. Schedule
+transitions require at least one named `schedule use` clause.
 
 ### ⏳ Waits
 ```hassl

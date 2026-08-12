@@ -29,6 +29,7 @@ class IRRule:
     # NEW: for each schedule use, the emitter can gate on ANY of these entity ids.
     # List of {"resolved": "pkg.name", "entities": [entity_id, ...]}
     schedule_gates: Optional[List[Dict[str, Any]]] = None
+    arm_when: Optional[Dict[str, Any]] = None
     
 @dataclass
 class IRProgram:
@@ -56,6 +57,7 @@ class IRProgram:
                 "schedules_inline": r.schedules_inline or [],
                 # surface gates so codegen can choose correct binary_sensor/input_boolean
                 "schedule_gates": r.schedule_gates or [],
+                "arm_when": r.arm_when,
             } for r in self.rules],
             "schedules": self.schedules or {},
             "holidays": self.holidays or {},
@@ -182,7 +184,10 @@ def analyze(prog: Program) -> IRProgram:
     def _deep_subst(obj: Any, subst: Dict[str, Any]) -> Any:
         # strings: replace only if exactly matches a parameter name
         if isinstance(obj, str):
-            return str(subst.get(obj, obj))
+            replacement = subst.get(obj, obj)
+            if isinstance(replacement, (dict, list)):
+                return copy.deepcopy(replacement)
+            return str(replacement)
         # dicts/lists: walk recursively
         if isinstance(obj, dict):
             return {k: _deep_subst(v, subst) for k, v in obj.items()}
@@ -554,6 +559,7 @@ def analyze(prog: Program) -> IRProgram:
             schedules_inline: List[dict] = []
             # Per-rule collection of precomputed gate entities
             schedule_gates: List[Dict[str, Any]] = []
+            arm_when: Optional[Dict[str, Any]] = None
 
             for c in s.clauses:
                 # IfClause-like items have .condition/.actions
@@ -580,6 +586,16 @@ def analyze(prog: Program) -> IRProgram:
                     for sc in c.get("clauses") or []:
                         if isinstance(sc, dict):
                             schedules_inline.append(sc)
+                elif isinstance(c, dict) and c.get("type") == "arm_when":
+                    if arm_when is not None:
+                        raise ValueError(f"rule '{s.name}': only one 'arm when' clause is allowed")
+                    arm_when = _walk_qualified_only(c.get("condition") or {})
+                elif isinstance(c, dict) and c.get("type") == "at":
+                    clauses.append({
+                        "type": "at",
+                        "time": _walk_qualified_only(c.get("time")),
+                        "actions": _walk_alias_with_qualified(c.get("actions") or []),
+                    })
                 elif isinstance(c, dict) and "condition" in c and "actions" in c:
                     cond = _walk_alias_with_qualified(c["condition"])
                     acts = _walk_alias_with_qualified(c["actions"])
@@ -588,12 +604,30 @@ def analyze(prog: Program) -> IRProgram:
                     # ignore unknown fragments
                     pass
 
+            if arm_when is not None and not schedule_uses:
+                raise ValueError(
+                    f"rule '{s.name}': 'arm when' requires at least one named 'schedule use' clause"
+                )
+
+            schedule_transitions = [
+                c for c in clauses
+                if c.get("type") == "at"
+                and isinstance(c.get("time"), dict)
+                and c["time"].get("kind") == "schedule"
+            ]
+            if schedule_transitions and not schedule_uses:
+                raise ValueError(
+                    f"rule '{s.name}': 'at schedule start/stop' requires at least one "
+                    "named 'schedule use' clause"
+                )
+
             rules.append(IRRule(
                 name=s.name,
                 clauses=clauses,
                 schedule_uses=schedule_uses,
                 schedules_inline=schedules_inline,
-                schedule_gates=schedule_gates
+                schedule_gates=schedule_gates,
+                arm_when=arm_when,
             ))
 
     # -------- NEW: validate schedule windows --------

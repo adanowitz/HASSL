@@ -256,6 +256,20 @@ class HasslTransformer(Transformer):
         if quals: cond.update(quals[-1])
         return nodes.IfClause(condition=cond, actions=actions)
 
+    def at_clause(self, time_spec, actions):
+        return {"type": "at", "time": time_spec, "actions": actions}
+
+    def schedule_transition(self, _schedule, transition):
+        return {"kind": "schedule", "event": str(transition)}
+
+    def arm_clause(self, *parts):
+        expr = parts[0]
+        quals = [p for p in parts[1:] if isinstance(p, dict) and "not_by" in p]
+        cond = {"expr": expr}
+        if quals:
+            cond.update(quals[-1])
+        return {"type": "arm_when", "condition": cond}
+
     def condition(self, expr, qual=None):
         cond = {"expr": expr}
         if qual is not None: cond.update(qual)
@@ -276,6 +290,10 @@ class HasslTransformer(Transformer):
     def comparison(self, left, op=None, right=None):
         if op is None: return left
         return {"op": str(op), "left": left, "right": right}
+
+    def event_keyword(self, val): return _atom(val)
+    def event_match(self, left, event_type):
+        return {"op": "event_is", "left": left, "right": event_type}
 
     def bare_operand(self, val): return _atom(val)
     def operand(self, val): return _atom(val)

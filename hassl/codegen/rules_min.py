@@ -2,6 +2,16 @@ import os, re, yaml
 from pathlib import Path
 from hassl.semantics import analyzer as sem_analyzer
 
+FRIENDLY_EVENT_TYPES = {
+    # Friendly HASSL gesture -> legacy integration names and HA standard names.
+    "pressed": ("initial_press", "press_start"),
+    "clicked": ("short_release", "press_end"),
+    "held": ("long_press", "long_press_start"),
+    "hold_released": ("long_release", "long_press_end"),
+    "multi_pressing": ("multi_press_ongoing",),
+    "multi_pressed": ("multi_press_complete", "multi_press_end"),
+}
+
 # ----------------- slug helpers -----------------
 def _slug(s: str) -> str:
     return re.sub(r'[^a-z0-9]+', '_', str(s).lower()).strip('_')
@@ -9,6 +19,60 @@ def _slug(s: str) -> str:
 def _safe_entity(e: str) -> str:
     # safe for helper entity ids (dots → underscores)
     return str(e).replace(".", "_")
+
+def _is_button_entity(entity_id) -> bool:
+    """Return whether an entity's state represents a momentary button press."""
+    if not isinstance(entity_id, str) or "." not in entity_id:
+        return False
+    return entity_id.split(".", 1)[0] in ("button", "input_button")
+
+def _is_event_entity(entity_id) -> bool:
+    """Return whether an entity emits timestamped Home Assistant events."""
+    if not isinstance(entity_id, str) or "." not in entity_id:
+        return False
+    return entity_id.split(".", 1)[0] == "event"
+
+def _button_press_condition(entity_id: str) -> dict:
+    """Match a real button state transition, excluding startup/attribute updates."""
+    return {
+        "condition": "template",
+        "value_template": (
+            "{{ trigger.platform == 'state' "
+            f"and trigger.entity_id == '{entity_id}' "
+            "and trigger.from_state is not none "
+            "and trigger.to_state is not none "
+            "and trigger.from_state.state != trigger.to_state.state }}"
+        ),
+    }
+
+def _event_entity_condition(entity_id: str, event_type=None) -> dict:
+    """Match a real event-entity emission, optionally filtering its event type."""
+    event_type_check = ""
+    if event_type is not None:
+        event_types = event_type if isinstance(event_type, (list, tuple)) else (event_type,)
+        escaped_event_types = [
+            str(value).replace("\\", "\\\\").replace("'", "\\'")
+            for value in event_types
+        ]
+        if len(escaped_event_types) == 1:
+            comparison = f"== '{escaped_event_types[0]}'"
+        else:
+            choices = ", ".join(f"'{value}'" for value in escaped_event_types)
+            comparison = f"in [{choices}]"
+        event_type_check = (
+            " and trigger.to_state.attributes.get('event_type') " + comparison
+        )
+    return {
+        "condition": "template",
+        "value_template": (
+            "{{ trigger.platform == 'state' "
+            f"and trigger.entity_id == '{entity_id}' "
+            "and trigger.from_state is not none "
+            "and trigger.to_state is not none "
+            "and trigger.from_state.state != trigger.to_state.state"
+            f"{event_type_check} }}}}"
+        ),
+    }
 
 def _dedup_dicts(seq):
     """Stable de-dup for lists of small dicts (e.g., triggers)."""
@@ -25,6 +89,9 @@ def _gate_entity(rule_name: str) -> str:
     slug = _slug(rule_name)
     return f"input_boolean.hassl_gate_{slug}"
 
+def _armed_entity(rule_name: str) -> str:
+    return f"input_boolean.hassl_armed_{_slug(rule_name)}"
+
 def _rule_ctx_key(rule_name: str, entity_id: str) -> str:
     # input_text key to hold the last context for a rule → entity action
     return f"hassl_ctx_rule_{_slug(rule_name)}_{_safe_entity(entity_id)}"
@@ -32,6 +99,55 @@ def _rule_ctx_key(rule_name: str, entity_id: str) -> str:
 def _entity_ctx_key(entity_id: str) -> str:
     # input_text key to hold the last context for a plain entity action
     return f"hassl_ctx_{_safe_entity(entity_id)}"
+
+def _schedule_active_expr(gate_groups) -> str:
+    """Build a Jinja expression: OR within each schedule, AND across schedules."""
+    groups = []
+    for entities in gate_groups:
+        states = [f"is_state('{e}', 'on')" for e in entities if isinstance(e, str)]
+        if states:
+            groups.append("(" + " or ".join(states) + ")")
+    return " and ".join(groups) if groups else "false"
+
+def _not_by_condition(qual, entities, current_rule, ctx_inputs):
+    """Compile a NOT_BY qualifier for state-triggered automations."""
+    if not qual or not entities:
+        return None
+
+    source_rule = None
+    if isinstance(qual, dict) and "rule" in qual:
+        source_rule = str(qual["rule"])
+    elif str(qual) == "this":
+        source_rule = current_rule
+
+    if source_rule:
+        for entity_id in entities:
+            ctx_inputs[_rule_ctx_key(source_rule, entity_id)] = entity_id
+        prefix = f"input_text.hassl_ctx_rule_{_slug(source_rule)}_"
+    else:
+        for entity_id in entities:
+            ctx_inputs[_entity_ctx_key(entity_id)] = entity_id
+        prefix = "input_text.hassl_ctx_"
+
+    return {
+        "condition": "template",
+        "value_template": (
+            "{{ trigger.to_state.context.parent_id != states('"
+            + prefix
+            + "' ~ trigger.entity_id|replace('.','_')) }}"
+        ),
+    }
+
+def _rule_context_stamp(rule_name, entity_id, ctx_inputs):
+    key = _rule_ctx_key(rule_name, entity_id)
+    ctx_inputs[key] = entity_id
+    return {
+        "service": "input_text.set_value",
+        "data": {
+            "entity_id": f"input_text.{key}",
+            "value": "{{ this.context.id }}",
+        },
+    }
 
 def _schedule_sensor(name: str, pkg: str) -> str:
     """
@@ -190,6 +306,13 @@ def _condition_to_ha(cond):
             if op == "not":
                 return {"condition": "not", "conditions": [cv(node["value"])]}
             left = node.get("left"); right = node.get("right")
+            if op == "event_is":
+                if not _is_event_entity(left):
+                    raise ValueError("HASSL: 'is <gesture>' requires an event.* entity")
+                event_types = FRIENDLY_EVENT_TYPES.get(str(right), (str(right),))
+                return _event_entity_condition(left, event_types)
+            if op == "==" and _is_event_entity(left) and isinstance(right, str):
+                return _event_entity_condition(left, right)
             if op == "==":
                 eid = left if isinstance(left, str) else str(left)
                 val = right
@@ -200,6 +323,16 @@ def _condition_to_ha(cond):
             if op in ("<", ">", "<=", ">="):
                 eid = left if isinstance(left, str) else str(left)
                 return {"condition": "template", "value_template": f"{{{{ states('{eid}')|float(0) {op} {right} }}}}"}
+        if _is_button_entity(node):
+            # Button entities expose the time of their latest press as state;
+            # they are events, not persistent on/off values.  Restrict the
+            # condition to the button that actually triggered this run.
+            return _button_press_condition(node)
+        if _is_event_entity(node):
+            # Event entities also store the time of their latest emission as
+            # state. A bare event operand matches each real emission; compare
+            # it to an event type to select one specific interaction.
+            return _event_entity_condition(node)
         if isinstance(node, str) and "." in node:
             return {"condition": "state", "entity_id": node, "state": "on"}
         return {"condition": "template", "value_template": "true"}
@@ -219,6 +352,36 @@ def _parse_offset(off: str) -> str:
     m_ = (seconds % 3600) // 60
     s = seconds % 60
     return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
+
+def _timed_rule_trigger(time_spec) -> dict:
+    """Compile a clock or sun time specification into a native HA trigger."""
+    if isinstance(time_spec, dict) and time_spec.get("kind") == "clock":
+        time_spec = time_spec.get("value")
+
+    if isinstance(time_spec, dict) and time_spec.get("kind") == "sun":
+        event = str(time_spec.get("event", "")).lower()
+        if event not in ("sunrise", "sunset"):
+            raise ValueError(f"HASSL: unsupported sun event '{event}'")
+        trigger = {"platform": "sun", "event": event}
+        offset = _parse_offset(time_spec.get("offset", "0s"))
+        if offset != "00:00:00":
+            trigger["offset"] = offset
+        return trigger
+
+    raw = str(time_spec).strip()
+    if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", raw):
+        return {"platform": "time", "at": f"{raw}:00"}
+
+    sun_match = re.fullmatch(r"(sunrise|sunset)([+-]\d+(?:ms|s|m|h|d))?", raw)
+    if sun_match:
+        trigger = {"platform": "sun", "event": sun_match.group(1)}
+        if sun_match.group(2):
+            trigger["offset"] = _parse_offset(sun_match.group(2))
+        return trigger
+
+    raise ValueError(
+        f"HASSL: invalid timed rule value '{raw}'; expected HH:MM, sunrise, or sunset"
+    )
 
 def _clock_between_cond(hhmm_start: str, hhmm_end: str):
     """
@@ -411,6 +574,7 @@ def generate_rules(ir, outdir):
          # For each referenced schedule, OR together its possible gate entities
          # (e.g., input_boolean.hassl_sched_* OR binary_sensor.hassl_schedule_*_active).
         schedule_gate_conditions = []
+        effective_gate_groups = []
  
         rule_gates = list(rule.get("schedule_gates") or []) if isinstance(rule, dict) else []
         used_names = list(use_by_rule.get(rname, []) or [])
@@ -420,6 +584,7 @@ def generate_rules(ir, outdir):
                 ents = [e for e in (g.get("entities") or []) if isinstance(e, str)]
                 if not ents:
                     continue
+                effective_gate_groups.append(ents)
                 if len(ents) == 1:
                     schedule_gate_conditions.append({
                         "condition": "state",
@@ -439,9 +604,11 @@ def generate_rules(ir, outdir):
             for nm in used_names:
                 base = str(nm).split(".")[-1]
                 decl_pkg = exported_sched_pkgs.get(base, pkg)
+                fallback_entity = _schedule_sensor(base, decl_pkg)
+                effective_gate_groups.append([fallback_entity])
                 schedule_gate_conditions.append({
                     "condition": "state",
-                    "entity_id": _schedule_sensor(base, decl_pkg),
+                    "entity_id": fallback_entity,
                     "state": "on"
                 })
 
@@ -452,53 +619,140 @@ def generate_rules(ir, outdir):
             if isinstance(cl, dict) and cl.get("type") == "schedule_clause":
                 inline_schedule_conditions.append(_schedule_clause_to_condition(cl))
 
+        arm_when = rule.get("arm_when") if isinstance(rule, dict) else None
+        armed_eid = _armed_entity(rname)
+        if arm_when:
+            arm_expr = _resolve_expr_aliases(arm_when.get("expr", {}), aliases)
+            arm_entities = sorted(_entity_ids_in_expr(arm_expr))
+            if not arm_entities:
+                raise ValueError(f"HASSL: rule '{rname}' arm condition must reference an entity")
+
+            arm_triggers = [{"platform": "state", "entity_id": e} for e in arm_entities]
+            if (
+                isinstance(arm_expr, dict)
+                and arm_expr.get("op") == "=="
+                and arm_expr.get("left") in arm_entities
+                and arm_expr.get("right") in ("on", "off")
+            ):
+                arm_triggers = [{
+                    "platform": "state",
+                    "entity_id": arm_expr["left"],
+                    "to": arm_expr["right"],
+                }]
+
+            arm_qual = _not_by_condition(
+                arm_when.get("not_by"), arm_entities, rname, ctx_inputs
+            )
+            arm_conditions = [
+                {"condition": "state", "entity_id": gate, "state": "on"},
+                *schedule_gate_conditions,
+                _condition_to_ha({"expr": arm_expr}),
+            ]
+            if arm_qual:
+                arm_conditions.append(arm_qual)
+
+            bundled.append({
+                "id": f"{_slug(rname)}__arm",
+                "alias": f"HASSL {rname} arm",
+                "mode": "restart",
+                "trigger": arm_triggers,
+                "condition": arm_conditions,
+                "action": [{
+                    "service": "input_boolean.turn_on",
+                    "target": {"entity_id": armed_eid},
+                }],
+            })
+
+            active_expr = _schedule_active_expr(effective_gate_groups)
+            inactive_template = "{{ not (" + active_expr + ") }}"
+            bundled.append({
+                "id": f"{_slug(rname)}__disarm",
+                "alias": f"HASSL {rname} disarm",
+                "mode": "restart",
+                "trigger": [{
+                    "platform": "template",
+                    "value_template": inactive_template,
+                }],
+                "action": [{
+                    "service": "input_boolean.turn_off",
+                    "target": {"entity_id": armed_eid},
+                }],
+            })
+
         # Now process each 'if' clause
         for idx, clause in enumerate(rule["clauses"]):
-            # Each clause is {"condition": ..., "actions": [...]}
+            # A clause is condition-driven or a native clock/sun trigger.
             cname = f"{_slug(rname)}__{idx+1}"
-            expr0 = clause["condition"].get("expr", {})
-            # resolve aliases inside the boolean expression
-            expr = _resolve_expr_aliases(expr0, aliases)
             actions = clause["actions"]
-            entities = sorted(_entity_ids_in_expr(expr))
-            triggers = [{"platform": "state", "entity_id": e} for e in entities] or [{"platform": "time", "at": "00:00:00"}]
-            triggers = _dedup_dicts(triggers)
-            # rebuild condition dict with resolved expr
-            cond_in = dict(clause["condition"])
-            cond_in["expr"] = expr
-            cond_ha = _condition_to_ha(cond_in)
+            schedule_transition = None
+            if clause.get("type") == "at":
+                entities = []
+                at_spec = clause.get("time")
+                if isinstance(at_spec, dict) and at_spec.get("kind") == "schedule":
+                    schedule_transition = str(at_spec.get("event", "")).lower()
+                    if schedule_transition not in ("start", "stop"):
+                        raise ValueError(
+                            f"HASSL: invalid schedule transition '{schedule_transition}'"
+                        )
+                    active_expr = _schedule_active_expr(effective_gate_groups)
+                    transition_expr = (
+                        active_expr
+                        if schedule_transition == "start"
+                        else f"not ({active_expr})"
+                    )
+                    transition_template = "{{ " + transition_expr + " }}"
+                    triggers = [
+                        {
+                            "platform": "template",
+                            "value_template": transition_template,
+                        },
+                        {"platform": "homeassistant", "event": "start"},
+                        {
+                            "platform": "state",
+                            "entity_id": gate,
+                            "to": "on",
+                        },
+                    ]
+                else:
+                    triggers = [_timed_rule_trigger(at_spec)]
+                cond_ha = None
+                qual_cond = None
+            else:
+                expr0 = clause["condition"].get("expr", {})
+                # resolve aliases inside the boolean expression
+                expr = _resolve_expr_aliases(expr0, aliases)
+                entities = sorted(_entity_ids_in_expr(expr))
+                triggers = [
+                    {"platform": "state", "entity_id": e} for e in entities
+                ] or [{"platform": "time", "at": "00:00:00"}]
+                triggers = _dedup_dicts(triggers)
+                # rebuild condition dict with resolved expr
+                cond_in = dict(clause["condition"])
+                cond_in["expr"] = expr
+                cond_ha = _condition_to_ha(cond_in)
+                qual = clause.get("condition", {}).get("not_by")
+                qual_cond = _not_by_condition(qual, entities, rname, ctx_inputs)
             gate_cond = {"condition": "state", "entity_id": gate, "state": "on"}
 
             # schedule gate conditions (all must be satisfied);
             # each item in schedule_gate_conditions is already either a state check
             # or an OR of multiple state checks for a single schedule.
-            sched_conds = list(schedule_gate_conditions)
-            if inline_schedule_conditions:
-                sched_conds.extend(inline_schedule_conditions)
-
-            # --- NOT_BY guard (qualifier) ---
-            qual = clause.get("condition", {}).get("not_by")
-            qual_cond = None
-            if qual:
-                ent0 = entities[0] if entities else None
-                if ent0:
-                    if isinstance(qual, dict) and "rule" in qual:
-                        rname_qual = _slug(str(qual["rule"]))
-                        it_key = _rule_ctx_key(rname_qual, ent0)
-                        ctx_inputs[it_key] = ent0
-                        qual_cond = {
-                            "condition": "template",
-                            "value_template": "{{ trigger.to_state.context.parent_id != "
-                                              "states('input_text.%s') }}" % it_key
-                        }
-                    else:
-                        it_key = _entity_ctx_key(ent0)
-                        ctx_inputs[it_key] = ent0
-                        qual_cond = {
-                            "condition": "template",
-                            "value_template": "{{ trigger.to_state.context.parent_id != "
-                                              "states('input_text.%s') }}" % it_key
-                        }
+            if schedule_transition == "start":
+                sched_conds = [{
+                    "condition": "template",
+                    "value_template": "{{ " + _schedule_active_expr(effective_gate_groups) + " }}",
+                }]
+            elif schedule_transition == "stop":
+                sched_conds = [{
+                    "condition": "template",
+                    "value_template": (
+                        "{{ not (" + _schedule_active_expr(effective_gate_groups) + ") }}"
+                    ),
+                }]
+            else:
+                sched_conds = list(schedule_gate_conditions)
+                if inline_schedule_conditions:
+                    sched_conds.extend(inline_schedule_conditions)
 
             act_list = []
             for act in actions:
@@ -513,6 +767,7 @@ def generate_rules(ir, outdir):
                         "service": "input_text.set_value",
                         "data": {"entity_id": _e, "value": "{{ this.context.id }}"}
                     })
+                    act_list.append(_rule_context_stamp(rname, eid, ctx_inputs))
                     act_list.append({"service": f"homeassistant.{service}", "target": {"entity_id": eid}})
                 elif act["type"] == "attr_assign":
                     eid = _resolve_name(act["entity"], aliases); attr = act["attr"]; val = act["value"]
@@ -561,6 +816,7 @@ def generate_rules(ir, outdir):
                             "service": "input_text.set_value",
                             "data": {"entity_id": _e, "value": "{{ this.context.id }}"}
                         })
+                        act_list.append(_rule_context_stamp(rname, eid, ctx_inputs))
                         act_list.append({"service": f"homeassistant.{service}", "target": {"entity_id": eid}})
                 elif act["type"] == "rule_ctrl":
                     target_rule = act["rule"]
@@ -593,7 +849,11 @@ def generate_rules(ir, outdir):
                         "data": {"name": "HASSL", "message": f"Unhandled action type: {act.get('type')}"}
                     })
 
-            conds = [gate_cond] + sched_conds + [cond_ha]
+            conds = [gate_cond] + sched_conds
+            if arm_when:
+                conds.append({"condition": "state", "entity_id": armed_eid, "state": "on"})
+            if cond_ha:
+                conds.append(cond_ha)
             if qual_cond:
                 conds.append(qual_cond)
 
@@ -646,6 +906,13 @@ def generate_rules(ir, outdir):
             "name": f"HASSL Gate {name}",
             "initial": "on",
         }
+
+    for rule in rules:
+        if rule.get("arm_when"):
+            key = f"hassl_armed_{_slug(rule['name'])}"
+            merged["input_boolean"][key] = {
+                "name": f"HASSL Armed {rule['name']}",
+            }
 
     # 4) Ensure input_text helpers referenced by NOT_BY guards *and* context stamps exist
     #    (ctx_inputs maps key -> human-friendly label for display)

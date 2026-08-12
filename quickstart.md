@@ -1,4 +1,4 @@
-# HASSL Quickstart (v1.4 – 2025 Edition, v0.4.0 Update)
+# HASSL Quickstart (v1.4 – 2025 Edition, v0.5.0 Update)
 
 Welcome to **HASSL**, the Home Assistant Simple Scripting Language — a compact, human-readable DSL that compiles into reliable, loop-safe Home Assistant automations.
 
