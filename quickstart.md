@@ -171,10 +171,13 @@ holidays us_ca:
     country="US", province="CA"
 
 schedule master_wake:
-  on weekdays 06:00–22:00 except holidays us_ca;
-  on weekends 08:00–22:00;
-  on holidays us_ca 09:00–22:00;
+  on weekdays 06:00-22:00 except holidays us_ca;
+  on weekends sunset-22:00;
+  on holidays us_ca sunset-sunrise;
 ```
+
+Window edges may be clock times or solar events with offsets, such as
+`on weekdays sunset-30m-sunrise+15m;`.
 
 ### Truth Table
 

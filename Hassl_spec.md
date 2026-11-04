@@ -97,7 +97,8 @@ schedule_holiday_only  = "on" "holidays" ident time_range ";" ;
 schedule_op    = "enable" | "disable" ;
 schedule_end   = "to" time_spec | "until" time_spec ;
 day_selector   = "weekdays" | "weekends" | "daily" ;
-time_range     = time_hhmm "-" time_hhmm ;
+time_range     = window_time "-" window_time ;
+window_time    = time_hhmm | time_sun ;
 holiday_mod    = "except" "holidays" ident ;
 
 period         = "during" "months" month_range
@@ -342,14 +343,17 @@ binary_sensor.hassl_schedule_<package>_<name>_active
 ```hassl
 schedule wake:
   on weekdays 08:00-19:00;
-  on weekends 09:00-22:00 except holidays us;
-  on holidays us 10:00-21:00;
+  on weekends sunset-22:00 except holidays us;
+  on holidays us sunset-sunrise;
 ```
 **Codegen** emits an **input_boolean** gate per schedule window set:
 ```
 input_boolean.hassl_sched_<package>_<name>
 ```
 Rules gate on **either** the window boolean or the legacy binary_sensor (OR’d), so older schedule forms and new window forms interoperate.
+
+Structured windows accept clock times, `sunrise`, `sunset`, and signed solar
+offsets on either edge, such as `sunset-30m-sunrise+15m`.
 
 ### Inline Rule Schedules
 ```hassl

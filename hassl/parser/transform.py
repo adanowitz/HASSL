@@ -494,8 +494,8 @@ class HasslTransformer(Transformer):
             holiday_mode = "except"
 
         return nodes.ScheduleWindow(
-            start=str(start) if start is not None else "00:00",
-            end=str(end) if end is not None else "00:00",
+            start=start if start is not None else {"kind": "clock", "value": "00:00"},
+            end=end if end is not None else {"kind": "clock", "value": "00:00"},
             day_selector=day,
             period=psel,
             holiday_ref=holiday_ref,
@@ -509,7 +509,9 @@ class HasslTransformer(Transformer):
             elif isinstance(a, tuple) and a and a[0] == "time": start, end = a[1], a[2]
             elif isinstance(a, dict) and "start" in a and "end" in a: start, end = a["start"], a["end"]
             elif isinstance(a, str) and a not in ("on","holidays",";"): ident = a
-        return nodes.ScheduleWindow(start=str(start), end=str(end),
+        return nodes.ScheduleWindow(
+                                    start=start if start is not None else {"kind": "clock", "value": "00:00"},
+                                    end=end if end is not None else {"kind": "clock", "value": "00:00"},
                                     day_selector="daily", period=None,
                                     holiday_ref=str(ident) if ident is not None else "",
                                     holiday_mode="only")
@@ -553,6 +555,9 @@ class HasslTransformer(Transformer):
     def time_range(self, *args):
         from lark import Token
         parts = [a for a in args if not (isinstance(a, Token) and str(a) == "-")]
+        specs = [p for p in parts if isinstance(p, dict) and p.get("kind") in ("clock", "sun")]
+        if len(specs) >= 2:
+            return ("time", specs[0], specs[1])
         times = [str(p) for p in parts if isinstance(p, Token) and p.type == "TIME_HHMM"]
         if len(times) >= 2: return ("time", times[0], times[1])
         s_parts = [str(p) for p in parts if not isinstance(p, Token)]

@@ -353,6 +353,68 @@ def _parse_offset(off: str) -> str:
     s = seconds % 60
     return f"{sign}{h:02d}:{m_:02d}:{s:02d}"
 
+
+def _offset_seconds_value(offset: str) -> int:
+    if not offset:
+        return 0
+    match = re.fullmatch(r"([+-])(\d+)(ms|s|m|h|d)", str(offset).strip())
+    if not match:
+        return 0
+    sign, amount, unit = match.group(1), int(match.group(2)), match.group(3)
+    seconds = {
+        "ms": 0,
+        "s": amount,
+        "m": amount * 60,
+        "h": amount * 3600,
+        "d": amount * 86400,
+    }[unit]
+    return seconds if sign == "+" else -seconds
+
+
+def _time_spec_seconds_expr(ts: dict) -> str:
+    if ts.get("kind") == "clock":
+        parts = str(ts.get("value", "00:00")).split(":")
+        hour = int(parts[0]) if parts and parts[0].isdigit() else 0
+        minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        second = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        return str(hour * 3600 + minute * 60 + second)
+    event = str(ts.get("event", "sunrise"))
+    attr = "next_setting" if event == "sunset" else "next_rising"
+    offset = _offset_seconds_value(str(ts.get("offset", "0s")))
+    local_event = f"as_local(as_datetime(state_attr('sun.sun', '{attr}')))"
+    return (
+        f"((({local_event}.hour * 3600) + ({local_event}.minute * 60) + "
+        f"{local_event}.second + {offset}) % 86400)"
+    )
+
+
+def _mixed_time_window_expr(start_ts: dict, end_ts: dict) -> str:
+    now_s = "((now().hour * 3600) + (now().minute * 60) + now().second)"
+    start_s = _time_spec_seconds_expr(start_ts)
+    end_s = _time_spec_seconds_expr(end_ts)
+    start_event = start_ts.get("event") if start_ts.get("kind") == "sun" else None
+    start_offset = _offset_seconds_value(str(start_ts.get("offset", "0s")))
+
+    if start_event == "sunset" and start_offset == 0 and end_ts.get("kind") == "clock":
+        next_rising = "as_local(as_datetime(state_attr('sun.sun', 'next_rising'))).date()"
+        evening = (
+            "(is_state('sun.sun', 'below_horizon') and "
+            f"{next_rising} > now().date())"
+        )
+        predawn = (
+            "(is_state('sun.sun', 'below_horizon') and "
+            f"{next_rising} == now().date())"
+        )
+        return (
+            f"(({start_s} < {end_s} and {evening} and {now_s} < {end_s}) or "
+            f"({start_s} >= {end_s} and ({evening} or ({predawn} and {now_s} < {end_s}))))"
+        )
+
+    return (
+        f"(({start_s} < {end_s} and ({now_s} >= {start_s} and {now_s} < {end_s})) or "
+        f"({start_s} >= {end_s} and ({now_s} >= {start_s} or {now_s} < {end_s})))"
+    )
+
 def _timed_rule_trigger(time_spec) -> dict:
     """Compile a clock or sun time specification into a native HA trigger."""
     if isinstance(time_spec, dict) and time_spec.get("kind") == "clock":
@@ -434,35 +496,11 @@ def _window_condition_from_specs(start_ts, end_ts):
             return {"condition": "or", "conditions": [after_start, before_end]}
         return {"condition": "and", "conditions": [after_start, before_end]}
 
-    # Mixed (clock ↔ sun) → fall back to a template that compares minute-of-day
+    # Mixed (clock ↔ sun) → compare local time-of-day. Do not compare now()
+    # with the full next solar event, because that event rolls forward immediately.
     return {
         "condition": "template",
-        "value_template": (
-            "{% set now_m = now().hour*60 + now().minute %}"
-            "{% macro tod(hhmm) %}{% set h=hhmm[0:2]|int %}{% set m=hhmm[3:5]|int %}{{ h*60+m }}{% endmacro %}"
-            "{% set s_m = ("
-            "{% if start.kind == 'clock' %}"
-            "  tod(start.value)"
-            "{% else %}"
-            "  (as_local(state_attr('sun.sun', 'next_' + start.event)).hour*60 + "
-            "   as_local(state_attr('sun.sun', 'next_' + start.event)).minute) "
-            "{% endif %}"
-            ") %}"
-            "{% set e_m = ("
-            "{% if end.kind == 'clock' %}"
-            "  tod(end.value)"
-            "{% else %}"
-            "  (as_local(state_attr('sun.sun', 'next_' + end.event)).hour*60 + "
-            "   as_local(state_attr('sun.sun', 'next_' + end.event)).minute) "
-            "{% endif %}"
-            ") %}"
-            "{{ (s_m < e_m and (now_m >= s_m and now_m < e_m)) "
-            "or (s_m >= e_m and (now_m >= s_m or now_m < e_m)) }}"
-        ),
-        "variables": {
-            "start": start_ts or {},
-            "end": end_ts or {},
-        }
+        "value_template": "{{ " + _mixed_time_window_expr(start_ts, end_ts) + " }}",
     }
 
 def _schedule_clause_to_condition(clause: dict):
@@ -518,7 +556,7 @@ def _collect_schedules(ir: dict):
 
 
 # ----------------- main generate -----------------
-def generate_rules(ir, outdir):
+def generate_rules(ir, outdir, package_slug=None):
     # Always build outputs, even if there are no rules (schedules may still exist)
     rules = ir.get("rules", []) or []
     Path(outdir).mkdir(parents=True, exist_ok=True)
@@ -527,8 +565,9 @@ def generate_rules(ir, outdir):
     # collect helper keys we must ensure exist
     ctx_inputs = {}
 
-    # package slug for output file naming
-    pkg = _pkg_slug(outdir)
+    # The CLI supplies a source-package namespace when multiple packages share
+    # one flat output directory. Direct callers retain outdir-based naming.
+    pkg = _slug(package_slug) if package_slug else _pkg_slug(outdir)
 
     # --- schedules collection ---
     declared_schedules, inline_by_rule, use_by_rule = _collect_schedules(ir)
@@ -866,8 +905,6 @@ def generate_rules(ir, outdir):
                 "action": act_list
             }
             bundled.append(auto)
-
-    pkg = _pkg_slug(outdir)
 
     out_path = Path(outdir) / f"rules_bundled_{pkg}.yaml"
     with open(out_path, "w") as f:

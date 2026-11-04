@@ -8,7 +8,6 @@ from .ast.nodes import Program, Alias, Schedule, TemplateDecl
 from lark import Lark
 from .semantics import analyzer as sem_analyzer
 from .semantics.analyzer import analyze
-from .codegen.package import emit_package
 from .codegen import generate as codegen_generate
 
 def parse_hassl(text: str) -> Program:
@@ -105,7 +104,7 @@ def _ensure_imports_loaded(programs, module_root: Path):
     """If imported packages aren't parsed yet, try to load their .hassl files from module_root."""
     # Track both package names (from parsed files) and module ids (from import statements)
     known_pkgs = {pkg for _, _, pkg in programs}
-    seen_modules: set[str] = set()  # abs_mod we've already attempted/loaded
+    seen_modules: set[tuple[str, str]] = set()  # (importer namespace, requested module)
     seen_paths: set[Path] = set(p for p, _, _ in programs)
 
     added = True
@@ -123,39 +122,64 @@ def _ensure_imports_loaded(programs, module_root: Path):
 
                 abs_mod = _normalize_module(importer_pkg, raw_mod)
 
+                # Imports inside a top-level namespace may omit that namespace:
+                # `common.schedules` from `home.hall.automation` resolves to
+                # `home.common.schedules`, while already-absolute imports such as
+                # `std.shared` still resolve from module_root unchanged.
+                module_candidates: List[str] = []
+                if not raw_mod.startswith(".") and importer_pkg:
+                    namespace = importer_pkg.split(".", 1)[0]
+                    if namespace and not abs_mod.startswith(namespace + "."):
+                        module_candidates.append(f"{namespace}.{abs_mod}")
+                module_candidates.append(abs_mod)
+                module_candidates = list(dict.fromkeys(module_candidates))
+                attempt_key = (importer_pkg.split(".", 1)[0], abs_mod)
+
                 # guard: avoid re-trying the same module or self-import
-                if abs_mod in seen_modules or abs_mod == importer_pkg:
+                if attempt_key in seen_modules or importer_pkg in module_candidates:
                     continue
 
-                # If we already have a program whose package == abs_mod, skip
-                if abs_mod in known_pkgs:
-                    seen_modules.add(abs_mod)
+                # The namespaced form may already be among the entry files (for
+                # example, home/hall/aliases.hassl in a hall directory build).
+                if any(mod in known_pkgs for mod in module_candidates):
+                    seen_modules.add(attempt_key)
                     continue
 
-                candidate = _module_to_path(module_root, abs_mod)
-                if not candidate.exists():
-                    print(f"[hasslc] Autoload candidate MISS for '{abs_mod}': {candidate}")
-                    seen_modules.add(abs_mod)  # mark as tried to avoid spamming
+                found = next(
+                    (
+                        (mod, _module_to_path(module_root, mod))
+                        for mod in module_candidates
+                        if _module_to_path(module_root, mod).exists()
+                    ),
+                    None,
+                )
+                if found is None:
+                    tried = ", ".join(
+                        str(_module_to_path(module_root, mod)) for mod in module_candidates
+                    )
+                    print(f"[hasslc] Autoload candidate MISS for '{abs_mod}': {tried}")
+                    seen_modules.add(attempt_key)  # mark as tried to avoid spamming
                     continue
+                resolved_mod, candidate = found
 
                 if candidate in seen_paths:
                     # We’ve already parsed this exact file; mark its module and move on
-                    print(f"[hasslc] Autoload candidate SKIP (already loaded) for '{abs_mod}': {candidate}")
-                    seen_modules.add(abs_mod)
+                    print(f"[hasslc] Autoload candidate SKIP (already loaded) for '{resolved_mod}': {candidate}")
+                    seen_modules.add(attempt_key)
                     continue
 
-                print(f"[hasslc] Autoload candidate FOUND for '{abs_mod}': {candidate}")
+                print(f"[hasslc] Autoload candidate FOUND for '{resolved_mod}': {candidate}")
                 with open(candidate, "r", encoding="utf-8") as f:
                     text = f.read()
 
                 p = parse_hassl(text)
                 # prefer declared package; otherwise bind to module id
-                pkg_name = p.package or abs_mod
+                pkg_name = p.package or resolved_mod
                 p.package = pkg_name
 
                 programs.append((candidate, p, pkg_name))
                 known_pkgs.add(pkg_name)
-                seen_modules.add(abs_mod)
+                seen_modules.add(attempt_key)
                 seen_paths.add(candidate)
                 added = True
                 
@@ -165,6 +189,16 @@ def main():
     ap.add_argument("input", help="Input .hassl file OR directory")
     ap.add_argument("-o", "--out", default="./packages/out", help="Output directory root for HA package(s)")
     ap.add_argument("--module-root", default=None, help="Optional root to derive package names from paths")
+    ap.add_argument(
+        "--include-dependencies",
+        action="store_true",
+        help="Also emit packages autoloaded only to resolve imports",
+    )
+    ap.add_argument(
+        "--debug-ir",
+        action="store_true",
+        help="Write namespaced IR and export-index JSON diagnostics",
+    )
     args = ap.parse_args()
 
     in_path = Path(args.input)
@@ -174,6 +208,7 @@ def main():
     src_files = _scan_hassl_files(in_path)
     if not src_files:
         raise SystemExit(f"[hasslc] No .hassl files found in {in_path}")
+    entry_paths = {path.resolve() for path in src_files}
 
     # Pass 0: parse all and assign/derive package names
     programs: List[tuple[Path, Program, str]] = []
@@ -207,32 +242,40 @@ def main():
         print("[hasslc] AST:", json.dumps(prog.to_dict(), indent=2))
         ir = analyze(prog)
         print("[hasslc] IR:", json.dumps(ir.to_dict(), indent=2))
-        all_ir.append((pkg, ir))
+        all_ir.append((path, pkg, ir))
 
-    # Emit: per package subdir
-    for pkg, ir in all_ir:
-        # One-level output: flatten dotted package id into a single directory name
-        # e.g., home.addie.automations -> packages/out/home_addie_automations/
-        pkg_dir = out_root / pkg.replace(".", "_")
-        print(f"[hasslc] Output directory (flat): {pkg_dir}")
-        os.makedirs(pkg_dir, exist_ok=True)
-        ir_dict = ir.to_dict() if hasattr(ir, "to_dict") else ir
-        codegen_generate(ir_dict, str(pkg_dir))
-        emit_package(ir, str(pkg_dir))
-        with open(pkg_dir / "DEBUG_ir.json", "w", encoding="utf-8") as dbg:
-            dbg.write(json.dumps(ir.to_dict(), indent=2))
-        print(f"[hasslc] Package written to {pkg_dir}")
+    # Emit every namespaced fragment directly into the requested directory.
+    # Home Assistant package include directories expect package YAML files at
+    # this level rather than in compiler-created subdirectories.
+    for path, pkg, ir in all_ir:
+        if path.resolve() not in entry_paths and not args.include_dependencies:
+            print(
+                f"[hasslc] Dependency {pkg} analyzed for imports; "
+                "not emitted (compile/deploy it separately)"
+            )
+            continue
+        pkg_slug = pkg.replace(".", "_")
+        # Both package and rule emitters need the same namespace now that the
+        # output directory itself no longer supplies one.
+        setattr(ir, "package", pkg_slug)
+        print(f"[hasslc] Output directory (flat): {out_root}")
+        codegen_generate(ir, str(out_root), package_slug=pkg_slug)
+        if args.debug_ir:
+            with open(out_root / f"DEBUG_ir_{pkg_slug}.json", "w", encoding="utf-8") as dbg:
+                dbg.write(json.dumps(ir.to_dict(), indent=2))
+        print(f"[hasslc] Package {pkg} written to {out_root}")
 
-    # Also drop a cross-project export table for debugging
-    with open(out_root / "DEBUG_exports.json", "w", encoding="utf-8") as fp:
+    # Optionally write the cross-project export table for compiler debugging.
+    if args.debug_ir:
         def _kind(v):
             if isinstance(v, Alias): return "Alias"
             if isinstance(v, Schedule): return "Schedule"
             if isinstance(v, TemplateDecl): return "Template"
             return type(v).__name__
         printable = {f"{k[0]}::{k[1]}::{k[2]}": _kind(v) for k, v in GLOBAL_EXPORTS.items()}
-        json.dump(printable, fp, indent=2)
-    print(f"[hasslc] Global exports index written to {out_root / 'DEBUG_exports.json'}")
+        with open(out_root / "DEBUG_exports.json", "w", encoding="utf-8") as fp:
+            json.dump(printable, fp, indent=2)
+        print(f"[hasslc] Global exports index written to {out_root / 'DEBUG_exports.json'}")
 
 if __name__ == "__main__":
     main()

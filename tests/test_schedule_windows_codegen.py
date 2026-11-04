@@ -1,6 +1,7 @@
 # tests/test_schedule_windows_codegen.py
 import yaml
 from pathlib import Path
+from collections import Counter
 
 from hassl.codegen import package as pkg_codegen
 from hassl.semantics.analyzer import IRProgram, IRSync
@@ -108,7 +109,9 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
     # Ending one window must not lower the shared helper while another window
     # still matches, or schedule consumers would see a false stop/start edge.
     off_autos = [a for a in autos if " off_" in a.get("alias", "")]
+    on_autos = [a for a in autos if " on_" in a.get("alias", "")]
     assert off_autos
+    assert on_autos
     assert all(
         any(
             c.get("condition") == "not"
@@ -116,6 +119,10 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
             for c in a.get("condition", [])
         )
         for a in off_autos
+    )
+    assert all(
+        not any(c.get("condition") == "not" for c in a.get("condition", []))
+        for a in on_autos
     )
 
     # Spot-check that at least one weekday condition and one weekend condition exist
@@ -132,6 +139,81 @@ def test_schedule_windows_codegen_weekday_weekend_and_holidays(tmp_path: Path):
     )
     assert has_weekdays, "expected a weekday time condition"
     assert has_weekends, "expected a weekend time condition"
+
+
+def test_mixed_legacy_window_schedule_has_one_solar_sensor(tmp_path: Path):
+    """A mixed schedule keeps one canonical sensor with rollover-safe solar state."""
+    ir = IRProgram(
+        aliases={},
+        syncs=[],
+        rules=[],
+        schedules={
+            "night_holiday": [{
+                "op": "enable",
+                "from": {"kind": "sun", "event": "sunset", "offset": "0s"},
+                "until": {"kind": "clock", "value": "22:00"},
+            }],
+        },
+        schedules_windows={
+            "night_holiday": [{
+                "start": {"kind": "clock", "value": "00:00"},
+                "end": {"kind": "clock", "value": "00:00"},
+                "day_selector": "daily",
+                "period": None,
+                "holiday_ref": "us_ca",
+                "holiday_mode": "only",
+            }],
+        },
+        holidays={
+            "us_ca": {
+                "id": "us_ca", "country": "US", "province": "CA",
+                "add": [], "remove": [], "workdays": [], "excludes": [],
+            },
+        },
+    )
+    setattr(ir, "package", "home.common.schedules")
+
+    pkg_codegen.emit_package(ir, str(tmp_path))
+    doc = _read_yaml(tmp_path / "schedules_home.common.schedules.yaml")
+    sensors = doc["template"][0]["binary_sensor"]
+    unique_ids = [sensor["unique_id"] for sensor in sensors]
+    duplicates = [uid for uid, count in Counter(unique_ids).items() if count > 1]
+
+    assert duplicates == []
+    sensor = next(
+        sensor for sensor in sensors
+        if sensor["unique_id"] == "hassl_schedule_home.common.schedules_night_holiday_active"
+    )
+    state = sensor["state"]
+    assert "sunset()" not in state
+    assert "next_rising" in state
+    assert "below_horizon" in state
+
+
+def test_sunset_until_sunrise_uses_sun_entity_state(tmp_path: Path):
+    ir = IRProgram(
+        aliases={},
+        syncs=[],
+        rules=[],
+        schedules={
+            "night": [{
+                "op": "enable",
+                "from": {"kind": "sun", "event": "sunset", "offset": "0s"},
+                "until": {"kind": "sun", "event": "sunrise", "offset": "0s"},
+            }],
+        },
+        schedules_windows={},
+        holidays={},
+    )
+    setattr(ir, "package", "home.common.schedules")
+
+    pkg_codegen.emit_package(ir, str(tmp_path))
+    doc = _read_yaml(tmp_path / "schedules_home.common.schedules.yaml")
+    sensor = doc["template"][0]["binary_sensor"][0]
+
+    assert "is_state('sun.sun', 'below_horizon')" in sensor["state"]
+    assert "sunset()" not in sensor["state"]
+    assert "sunrise()" not in sensor["state"]
 
 
 def test_schedule_windows_with_periods_and_mixed_days(tmp_path: Path):

@@ -106,9 +106,10 @@ schedule_clause: schedule_legacy_clause
 // Legacy (unchanged)
 schedule_legacy_clause: schedule_op FROM time_spec schedule_end? ";"
 
-// NEW schedule window syntax:
-//   [during <period>] on (weekdaysNo, |weekends|daily) HH:MM-HH:MM [except holidays <id>] ;
-//   on holidays <id> HH:MM-HH:MM ;
+// Structured schedule window syntax. Window edges accept clocks or solar events
+// with offsets, for example sunset-30m-sunrise+15m.
+//   [during <period>] on (weekdays | weekends | daily) <time>-<time> [except holidays <id>] ;
+//   on holidays <id> <time>-<time> ;
 schedule_window_clause: period? "on" day_selector time_range holiday_mod? ";"
 
 sched_holiday_only: "on" "holidays" CNAME time_range ";"
@@ -125,7 +126,9 @@ ymd_range: YMD ".." YMD
 YMD: /\d{4}-\d{2}-\d{2}/
 
 day_selector: WEEKDAYS | WEEKENDS | DAILY
-time_range: TIME_HHMM "-" TIME_HHMM
+time_range: window_time_spec "-" window_time_spec
+?window_time_spec: TIME_HHMM       -> time_clock
+                 | sun_spec
 holiday_mod: "except" "holidays" CNAME
 
 schedule_op: ENABLE | DISABLE

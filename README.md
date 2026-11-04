@@ -121,7 +121,14 @@ hasslc --help
    ```
 3. Copy the package into `/config/packages/` and reload automations.
 
-Each `.hassl` file compiles into an isolated package — no naming collisions, no shared helpers.
+Each `.hassl` file namespaces its generated files and entities to avoid naming collisions.
+
+When the input is a directory, all generated YAML fragments are written directly
+into the requested output directory. Modules autoloaded through `--module-root`
+are used to resolve imports but are not emitted again: a consumer references the
+helpers owned by the common package. Compile the common module separately (or
+compile the whole source root once). Use `--include-dependencies` only when you
+intentionally want imported modules included in the same build output.
 
 ---
 
@@ -210,10 +217,13 @@ holidays us_ca:
     country="US", province="CA"
 
 schedule master_wake:
-  on weekdays 06:00–22:00 except holidays us_ca;
-  on weekends 08:00–22:00;
-  on holidays us_ca 09:00–22:00;
+  on weekdays 06:00-22:00 except holidays us_ca;
+  on weekends sunset-22:00;
+  on holidays us_ca sunset-sunrise;
 ```
+
+Structured schedule ranges accept clock times, `sunrise`, `sunset`, and solar
+offsets, for example `on weekdays sunset-30m-sunrise+15m;`.
 
 🧩 **Note:**  
 Both sensors must be created manually in the Home Assistant UI — integrations can’t be defined in YAML.  

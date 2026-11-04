@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hassl.cli import parse_hassl  # parser + transformer
 from hassl.semantics import analyzer as sem_analyzer  # to set GLOBAL_EXPORTS
@@ -255,6 +256,58 @@ rule r:
     bundled = (outdir / f"rules_bundled_{pkg_slug}.yaml").read_text()
     # gate should reference the window helper input_boolean (package-based)
     assert "input_boolean.hassl_sched_home_landing_wake" in bundled
+
+
+def test_structured_schedule_windows_accept_solar_edges_and_offsets(tmp_path: Path):
+    src = """
+package home.solar
+
+holidays us_ca:
+  country="US", province="CA"
+
+schedule lighting:
+  on weekdays sunset-22:00;
+  on weekends sunset-30m-sunrise+15m;
+  on daily sunrise+20m-sunset-10m;
+  on holidays us_ca sunset-sunrise;
+"""
+    program = parse_hassl(src)
+    ir = analyze(program)
+    setattr(ir, "package", program.package)
+    windows = ir.to_dict()["schedules_windows"]["lighting"]
+
+    assert windows[0]["start"] == {
+        "kind": "sun", "event": "sunset", "offset": "0s",
+    }
+    assert windows[0]["end"] == {"kind": "clock", "value": "22:00"}
+    assert windows[1]["start"]["offset"] == "-30m"
+    assert windows[1]["end"] == {
+        "kind": "sun", "event": "sunrise", "offset": "+15m",
+    }
+    assert windows[2]["start"]["offset"] == "+20m"
+    assert windows[2]["end"]["offset"] == "-10m"
+    assert windows[3]["holiday_ref"] == "us_ca"
+    assert windows[3]["holiday_mode"] == "only"
+
+    outdir = tmp_path / "out_solar"
+    pkg_codegen.emit_package(ir, str(outdir))
+    schedule_doc = yaml.safe_load(
+        (outdir / "schedule_home.solar_lighting.yaml").read_text()
+    )
+    automations = schedule_doc["automation"]
+
+    assert automations[0]["trigger"] == [{"platform": "sun", "event": "sunset"}]
+    assert automations[1]["trigger"] == [{"platform": "time", "at": "22:00:00"}]
+    assert automations[2]["trigger"] == [
+        {"platform": "sun", "event": "sunset", "offset": "-00:30:00"}
+    ]
+    assert automations[3]["trigger"] == [
+        {"platform": "sun", "event": "sunrise", "offset": "+00:15:00"}
+    ]
+    maintenance = next(a for a in automations if a["alias"].endswith(" maint"))
+    assert {t.get("event") for t in maintenance["trigger"] if t["platform"] == "sun"} == {
+        "sunrise", "sunset",
+    }
 
 
 def test_schedule_use_missing_declaration_raises(tmp_path: Path):

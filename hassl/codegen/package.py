@@ -114,6 +114,10 @@ class ScheduleRegistry:
         self.created[name] = eid
         return eid
 
+    def has_decl(self, name: str) -> bool:
+        """Return whether a legacy helper already owns the canonical sensor id."""
+        return name in self.created
+
     # New: create/reuse a period template sensor for a schedule window
     def ensure_period_sensor(self, sched_name: str, period: Dict[str, Any] | None) -> str | None:
         if not period:
@@ -188,17 +192,11 @@ def _window_condition_from_specs(start_ts, end_ts):
         if wrap:
             return {"condition": "or", "conditions": [after_start, before_end]}
         return {"condition": "and", "conditions": [after_start, before_end]}
-    # mixed → minute-of-day template (pure expression, no {% %})
-    NOWM = "(now().hour*60 + now().minute)"
-    SM = "(((start.value[0:2]|int)*60 + (start.value[3:5]|int)) if start.kind == 'clock' else (as_local(state_attr('sun.sun','next_' ~ start.event)).hour*60 + as_local(state_attr('sun.sun','next_' ~ start.event)).minute))"
-    EM = "(((end.value[0:2]|int)*60 + (end.value[3:5]|int)) if end.kind == 'clock' else (as_local(state_attr('sun.sun','next_' ~ end.event)).hour*60 + as_local(state_attr('sun.sun','next_' ~ end.event)).minute))"
+    # Mixed clock/sun windows use the same rollover-safe state expression as
+    # named legacy schedules.
     return {
         "condition": "template",
-        "value_template": (
-            f"( ({SM} < {EM} and ({NOWM} >= {SM} and {NOWM} < {EM})) "
-            f"or ({SM} >= {EM} and ({NOWM} >= {SM} or {NOWM} < {EM})) )"
-        ),
-        "variables": {"start": start_ts or {}, "end": end_ts or {}}
+        "value_template": _wrap_tpl(_time_window_expr(start_ts, end_ts)),
     }
     
 
@@ -249,22 +247,92 @@ def _trigger_for(ts: Dict[str, Any]) -> Dict[str, Any]:
     # Fallback: evaluate soon; maintenance automation will correct state anyway
     return {"platform": "time_pattern", "minutes": "/1"}
 
-def _jinja_offset(offset: str) -> str:
-    """
-    Convert '+15m'/'-10s'/'2h' to a Jinja timedelta expression snippet:
-      ' + timedelta(minutes=15)' / ' - timedelta(seconds=10)' / ' + timedelta(hours=2)'
-    Home Assistant’s Jinja has 'timedelta' filter available. Milliseconds are ignored.
-    """
+def _offset_seconds(offset: str) -> int:
+    """Convert a HASSL sun offset to signed seconds for time-of-day templates."""
     if not offset:
-        return ""
-    m = re.fullmatch(r"([+-])(\d+)(ms|s|m|h|d)", str(offset).strip())
-    if not m:
-        return ""
-    sign, n, unit = m.group(1), int(m.group(2)), m.group(3)
-    if unit == "ms":
-        return ""  # HA templates don’t support ms granularity cleanly; ignore
-    kw = {"s":"seconds", "m":"minutes", "h":"hours", "d":"days"}[unit]
-    return f" {sign} timedelta({kw}={n})"
+        return 0
+    match = re.fullmatch(r"([+-])(\d+)(ms|s|m|h|d)", str(offset).strip())
+    if not match:
+        return 0
+    sign, amount, unit = match.group(1), int(match.group(2)), match.group(3)
+    seconds = {
+        "ms": 0,
+        "s": amount,
+        "m": amount * 60,
+        "h": amount * 3600,
+        "d": amount * 86400,
+    }[unit]
+    return seconds if sign == "+" else -seconds
+
+
+def _sun_attr(event: str) -> str:
+    return "next_setting" if event == "sunset" else "next_rising"
+
+
+def _time_spec_seconds_expr(ts: Any) -> str:
+    """Render a time spec as local seconds since midnight in Home Assistant Jinja."""
+    if isinstance(ts, dict) and ts.get("kind") == "clock":
+        parts = str(ts.get("value", "00:00")).split(":")
+        hour = int(parts[0]) if parts and parts[0].isdigit() else 0
+        minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        second = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        return str(hour * 3600 + minute * 60 + second)
+    if isinstance(ts, dict) and ts.get("kind") == "sun":
+        attr = _sun_attr(str(ts.get("event", "sunrise")))
+        offset = _offset_seconds(str(ts.get("offset", "0s")))
+        local_event = f"as_local(as_datetime(state_attr('sun.sun', '{attr}')))"
+        return (
+            f"((({local_event}.hour * 3600) + ({local_event}.minute * 60) + "
+            f"{local_event}.second + {offset}) % 86400)"
+        )
+    return "0"
+
+
+def _time_window_expr(start: Any, end: Any) -> str:
+    """Build a rollover-safe state expression for a clock/sun time window."""
+    now_s = "((now().hour * 3600) + (now().minute * 60) + now().second)"
+    start_s = _time_spec_seconds_expr(start)
+    end_s = _time_spec_seconds_expr(end)
+
+    start_is_sun = isinstance(start, dict) and start.get("kind") == "sun"
+    end_is_sun = isinstance(end, dict) and end.get("kind") == "sun"
+    start_event = start.get("event") if start_is_sun else None
+    end_event = end.get("event") if end_is_sun else None
+    start_offset = _offset_seconds(str(start.get("offset", "0s"))) if start_is_sun else 0
+    end_offset = _offset_seconds(str(end.get("offset", "0s"))) if end_is_sun else 0
+
+    # The sun entity changes state exactly at unoffset sunrise and sunset. Using it
+    # avoids comparing now() with a "next" event that rolls forward immediately.
+    if start_is_sun and end_is_sun and start_offset == 0 and end_offset == 0:
+        if start_event == "sunset" and end_event == "sunrise":
+            return "is_state('sun.sun', 'below_horizon')"
+        if start_event == "sunrise" and end_event == "sunset":
+            return "is_state('sun.sun', 'above_horizon')"
+
+    # For the common sunset-to-clock window, distinguish this evening from the
+    # pre-dawn portion of the next calendar day. This makes the sunset edge exact
+    # while still supporting endpoints that intentionally wrap past midnight.
+    if start_event == "sunset" and start_offset == 0 and not end_is_sun:
+        next_rising = "as_local(as_datetime(state_attr('sun.sun', 'next_rising'))).date()"
+        evening = (
+            "(is_state('sun.sun', 'below_horizon') and "
+            f"{next_rising} > now().date())"
+        )
+        predawn = (
+            "(is_state('sun.sun', 'below_horizon') and "
+            f"{next_rising} == now().date())"
+        )
+        return (
+            f"(({start_s} < {end_s} and {evening} and {now_s} < {end_s}) or "
+            f"({start_s} >= {end_s} and ({evening} or ({predawn} and {now_s} < {end_s}))))"
+        )
+
+    # Compare local times of day, not the full next-event datetimes. The latter
+    # advance to tomorrow at the sun edge and can therefore never become active.
+    return (
+        f"(({start_s} < {end_s} and ({now_s} >= {start_s} and {now_s} < {end_s})) or "
+        f"({start_s} >= {end_s} and ({now_s} >= {start_s} or {now_s} < {end_s})))"
+    )
 
 def _emit_schedule_helper_yaml(entity_id: str, pkg: str, name: str, clauses: List[Dict]) -> Dict:
     """
@@ -279,58 +347,11 @@ def _emit_schedule_helper_yaml(entity_id: str, pkg: str, name: str, clauses: Lis
     disable_exprs: List[str] = []
 
     def ts_to_expr_in_window(start: Any, end: Any) -> str:
-        # CLOCK → CLOCK: pure expression (no control blocks) so it can live inside {{ ... }}
-        if isinstance(start, dict) and start.get("kind") == "clock" and \
-           isinstance(end, dict) and end.get("kind") == "clock":
-            s = start["value"]
-            e = end["value"]
-            # Zero-padded HH:MM strings compare lexicographically.
-            # in_window = (S <= now < E) if S < E
-            #           = (now >= S) or (now < E) if S >= E  (wrap past midnight)
-            now_call = "now().strftime('%H:%M')"
-            return (
-                f"( ('{s}' < '{e}' and ({now_call} >= '{s}' and {now_call} < '{e}')) "
-                f"or ('{s}' >= '{e}' and ({now_call} >= '{s}' or {now_call} < '{e}')) )"
-            )
-
-        # SUN → SUN: use sun condition edges; sunset..sunrise wraps, sunrise..sunset doesn’t
-        if isinstance(start, dict) and start.get("kind") == "sun" and isinstance(end, dict) and end.get("kind") == "sun":
-            s_ev = start["event"]; s_off = _jinja_offset(start.get("offset", "0s"))
-            e_ev = end["event"];   e_off = _jinja_offset(end.get("offset", "0s"))
-            # after start AND before end, with wrap handled by OR(after start, before end) for sunset->sunrise
-            if s_ev == "sunset" and e_ev == "sunrise":
-                return (
-                    f"( now() >= (as_local({s_ev}()){s_off}) ) "
-                    f"or ( now() <= (as_local({e_ev}()){e_off}) )"
-                )
-            return (
-                f"( now() >= (as_local({s_ev}()){s_off}) ) "
-                f"and ( now() <= (as_local({e_ev}()){e_off}) )"
-            )
-
-        # MIXED (clock ↔ sun or others):
-        # Use a conservative check: after start AND before end in wall-clock sense,
-        # relying on HA updating templates minutely. This won’t be perfect for
-        # all edge cases but is robust enough for typical use.
-        def single_edge(ts: Any, edge: str) -> str:
-            if isinstance(ts, dict) and ts.get("kind") == "clock":
-                hhmm = ts["value"]
-                if edge == "after":
-                    return f"( now().strftime('%H:%M') >= '{hhmm}' )"
-                else:
-                    return f"( now().strftime('%H:%M') <= '{hhmm}' )"
-            if isinstance(ts, dict) and ts.get("kind") == "sun":
-                ev = ts["event"]; off = _jinja_offset(ts.get("offset", "0s"))
-                if edge == "after":
-                    return f"( now() >= (as_local({ev}()){off}) )"
-                else:
-                    return f"( now() <= (as_local({ev}()){off}) )"
-            # entity/CNAME: treat as boolean state('on')
-            if isinstance(ts, str):
-                return f"( is_state('{ts}', 'on') )"
-            return "true"
-
-        return f"( {single_edge(start,'after')} and {single_edge(end,'before')} )"
+        if isinstance(start, dict) and isinstance(end, dict):
+            return _time_window_expr(start, end)
+        if isinstance(start, str) and isinstance(end, str):
+            return f"( is_state('{start}', 'on') and is_state('{end}', 'on') )"
+        return "true"
 
     for c in clauses or []:
         op = (c.get("op") or "enable").lower()
@@ -348,8 +369,9 @@ def _emit_schedule_helper_yaml(entity_id: str, pkg: str, name: str, clauses: Lis
                 hhmm = ts["value"]
                 expr = f"( now().strftime('%H:%M') >= '{hhmm}' )" if st is not None else f"( now().strftime('%H:%M') <= '{hhmm}' )"
             elif isinstance(ts, dict) and ts.get("kind") == "sun":
-                ev = ts["event"]; off = _jinja_offset(ts.get("offset","0s"))
-                expr = f"( now() >= (as_local({ev}()){off}) )" if st is not None else f"( now() <= (as_local({ev}()){off}) )"
+                event_s = _time_spec_seconds_expr(ts)
+                now_s = "((now().hour * 3600) + (now().minute * 60) + now().second)"
+                expr = f"( {now_s} >= {event_s} )" if st is not None else f"( {now_s} <= {event_s} )"
             elif isinstance(ts, str):
                 expr = f"( is_state('{ts}', 'on') )"
             else:
@@ -609,7 +631,11 @@ def emit_package(ir: IRProgram, outdir: str):
             
             if prop == "onoff":
                 for m in s.members:
-                    triggers.append({"platform": "state", "entity_id": m})
+                    # Explicit target states prevent attribute-only updates and
+                    # transitions to unknown/unavailable from being interpreted
+                    # as an off command for the entire sync group.
+                    triggers.append({"platform": "state", "entity_id": m, "to": "on"})
+                    triggers.append({"platform": "state", "entity_id": m, "to": "off"})
                     
                 conditions.append({"condition": "template",
                                    "value_template": (
@@ -622,7 +648,7 @@ def emit_package(ir: IRProgram, outdir: str):
                         {"conditions": [{"condition":"template","value_template":"{{ trigger.to_state.state == 'on' }}"}],
                          "sequence": [{"service":"input_boolean.turn_on","target":{"entity_id":f"input_boolean.hassl_{_safe(s.name)}_onoff"}}]
                          },
-                        {"conditions": [{"condition":"template","value_template":"{{ trigger.to_state.state != 'on' }}"}],
+                        {"conditions": [{"condition":"template","value_template":"{{ trigger.to_state.state == 'off' }}"}],
                          "sequence": [{"service":"input_boolean.turn_off","target": {"entity_id": f"input_boolean.hassl_{_safe(s.name)}_onoff"}}]
                          }
                     ]
@@ -776,14 +802,17 @@ def emit_package(ir: IRProgram, outdir: str):
         bool_eid = f"input_boolean.{sched_bool_key}"
 
         # --- Back-compat: emit '_active' template mirrors that follow the input_boolean ---
-        # 1) Primary mirror: binary_sensor.hassl_schedule_<pkg>_<name>_active
+        # 1) Primary mirror: binary_sensor.hassl_schedule_<pkg>_<name>_active.
+        # A mixed legacy/window schedule already has a canonical legacy sensor;
+        # keep that sensor and let consumers OR it with this input_boolean.
         pkg_safe = _safe(pkg)
         mirror_name = f"hassl_schedule_{pkg_safe}_{_safe(sched_name)}_active"
-        sched_reg.sensors.append({
-            "name": mirror_name,
-            "unique_id": mirror_name,
-            "state": "{{ is_state('" + bool_eid + "', 'on') }}"
-        })
+        if not sched_reg.has_decl(sched_name):
+            sched_reg.sensors.append({
+                "name": mirror_name,
+                "unique_id": mirror_name,
+                "state": "{{ is_state('" + bool_eid + "', 'on') }}"
+            })
         # 2) Legacy alias (no pkg): binary_sensor.hassl_schedule_automations_<name>_active
         # Some existing rulegen referenced this older name; keep it as a thin mirror.
         legacy_alias = f"hassl_schedule_automations_{_safe(sched_name)}_active"
@@ -854,7 +883,7 @@ def emit_package(ir: IRProgram, outdir: str):
             }
             ec = [c for c in edge_conds if c]
             if ec:
-                on_auto["condition"] = ec
+                on_auto["condition"] = copy.deepcopy(ec)
             per_schedule_automations.setdefault(sched_name, []).append(on_auto)
 
             off_auto = {
@@ -864,7 +893,7 @@ def emit_package(ir: IRProgram, outdir: str):
                 "action": [ { "service": "input_boolean.turn_off", "target": {"entity_id": bool_eid} } ]
             }
             if ec:
-                off_auto["condition"] = ec
+                off_auto["condition"] = copy.deepcopy(ec)
             per_schedule_automations.setdefault(sched_name, []).append(off_auto)
             off_automations.append(off_auto)
 

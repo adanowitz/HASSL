@@ -42,8 +42,8 @@ class PeriodSelector:
 
 @dataclass
 class ScheduleWindow:
-    start: str                    # "HH:MM"
-    end: str                      # "HH:MM"
+    start: Any                    # clock/sun time-spec dict
+    end: Any                      # clock/sun time-spec dict
     day_selector: str             # "weekdays" | "weekends" | "daily"
     period: Optional[PeriodSelector] = None
     holiday_ref: Optional[str] = None   # id from HolidaySet (for 'except'/'only')

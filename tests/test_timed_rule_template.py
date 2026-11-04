@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hassl.codegen.rules_min import _window_condition_from_specs
 from .util_compile import run_compile
 
 
@@ -73,6 +74,19 @@ def test_timed_rule_supports_sunrise_with_offset(tmp_path: Path):
     assert automation["trigger"] == [
         {"platform": "sun", "event": "sunrise", "offset": "+00:20:00"}
     ]
+
+
+def test_inline_sunset_window_uses_rollover_safe_sun_state():
+    condition = _window_condition_from_specs(
+        {"kind": "sun", "event": "sunset", "offset": "0s"},
+        {"kind": "clock", "value": "22:00"},
+    )
+
+    template = condition["value_template"]
+    assert "sunset()" not in template
+    assert "next_sunset" not in template
+    assert "next_rising" in template
+    assert "below_horizon" in template
 
 
 def test_timed_rule_rejects_invalid_clock_value(tmp_path: Path):
