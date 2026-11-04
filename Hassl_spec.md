@@ -1,5 +1,5 @@
 # HASSL Language Specification (v1.4 – 2025 Edition)
-_Updated for toolchain **v0.5.0** (timed rules; schedule transitions; event gestures; rule arming)._
+_Updated for toolchain **v0.6.0** (room-scoped builds; richer schedules; safer synchronization)._
   
 This document describes the grammar, semantics, and runtime model for  
 **HASSL** — the *Home Assistant Simple Scripting Language.*
